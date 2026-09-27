@@ -25,16 +25,24 @@ it. Both ends are pinned in the self-test.
     python xydrift.py --layer prod.sde/Addresses
     python xydrift.py --layer prod.sde/Addresses --tolerance 0.5 --tolerance-units meters
     python xydrift.py --layer prod.sde/Addresses --workspace prod.sde --apply
+    python xydrift.py --from-geojson points.geojson --xy-crs 4326
+
+--layer needs arcpy. --from-geojson and --self-test need only the standard library,
+and --from-geojson never writes anything.
 
 Exit codes: 0 no drift or resync done, 1 drift found and not written, 2 the resync
-failed part way, 64 usage error.
+failed part way, 3 arcpy is missing or failed while reading, and nothing was
+written, 64 usage error, refused input, or no row had a geometry to compare.
 """
 
 from __future__ import print_function
 
 import argparse
+import json
 import math
+import os
 import sys
+import time
 
 # =============================================================================
 # CONFIGURATION. Deliberately not flags. Change here, not at the call site.
@@ -72,6 +80,20 @@ NUMERIC_COORD_TYPES = ("Double", "Single")
 
 # Bits of mantissa in a Single (float32) column, including the implicit bit.
 SINGLE_MANTISSA_BITS = 24
+
+# The only system GeoJSON geometry is in. RFC 7946 fixes it at WGS84 lon/lat.
+GEOJSON_WKID = 4326
+
+# Names an old-style GeoJSON "crs" member may carry and still mean lon/lat.
+# RFC 7946 removed the member; GDAL still writes the first name. Compared
+# without regard to case.
+LONLAT_CRS_NAMES = (
+    "urn:ogc:def:crs:OGC:1.3:CRS84",
+    "urn:ogc:def:crs:OGC::CRS84",
+    "OGC:CRS84",
+    "urn:ogc:def:crs:EPSG::4326",
+    "EPSG:4326",
+)
 
 # =============================================================================
 # End of CONFIGURATION.
@@ -121,13 +143,25 @@ def delta(a, b):
     return abs(a - b)
 
 
-def wrapped_delta(a, b):
+def wrapped_delta(a, b, slack=0.0):
     """Distance in degrees between two longitudes, the short way round.
 
     -180 and +180 are the same meridian. A plain subtraction calls them 360
     degrees apart, which reads as the largest drift the layer can hold on the
     one line where nothing moved at all.
+
+    Only that seam is wrapped. A value past +/-180 is not a longitude, so it
+    is measured plainly: a stored -442.2, or 277.8 in the 0-360 convention,
+    is a whole turn from -82.2 and is drift, not a match.
+
+    slack is the tolerance. A value that far past 180 or less is within the
+    tolerance of the meridian, so it is still a longitude. Without it, a
+    stored 180.0000001 was OK against +180 and 360 degrees of drift against
+    -180, the same place, and --apply rewrote a row that agreed.
     """
+    limit = 180.0 + slack
+    if abs(rounded(a)) > limit or abs(rounded(b)) > limit:
+        return abs(a - b)
     d = abs(a - b) % 360.0
     if d > 180.0:
         d = 360.0 - d
@@ -147,17 +181,19 @@ def classify_pair(stored, new, tolerance, wrap=False):
         return NO_GEOMETRY
     if stored is None:
         return FILL
-    d = wrapped_delta(stored, new) if wrap else delta(stored, new)
+    d = wrapped_delta(stored, new, tolerance) if wrap else delta(stored, new)
     # Strictly greater, as the source this was taken from has it. A value
-    # exactly at the tolerance is inside the tolerance.
-    return DRIFT if d > tolerance else OK
+    # exactly at the tolerance is inside the tolerance. Written as "inside,
+    # else DRIFT" and not "greater, else OK": a NaN column gives a NaN
+    # distance, which is never greater than a tolerance, and read as clean.
+    return OK if d <= tolerance else DRIFT
 
 
-def measure(stored, new, wrap=False):
+def measure(stored, new, wrap=False, slack=0.0):
     """Distance between a stored coordinate and its geometry, or None."""
     if stored is None or new is None:
         return None
-    return wrapped_delta(stored, new) if wrap else delta(stored, new)
+    return wrapped_delta(stored, new, slack) if wrap else delta(stored, new)
 
 
 def worst(*verdicts):
@@ -180,7 +216,7 @@ def plan_row(oid, stored_x, stored_y, geom_x, geom_y, tolerance, wrap=False):
     new_x = geom_x if vx in (DRIFT, FILL) else None
     new_y = geom_y if vy in (DRIFT, FILL) else None
     return RowPlan(oid, worst(vx, vy),
-                   measure(stored_x, geom_x, wrap),
+                   measure(stored_x, geom_x, wrap, tolerance),
                    measure(stored_y, geom_y, False),
                    new_x, new_y)
 
@@ -237,7 +273,9 @@ def resolve_tolerance(value, units, geographic, meters_per_unit=None):
     """
     if value is None:
         raise ValueError("no tolerance given")
-    if value <= 0:
+    # NaN and infinity pass both "<= 0" and the grid check below, and then
+    # no difference is ever greater than them: every drifted row reads OK.
+    if not is_number(value) or value <= 0:
         raise ValueError("a tolerance of %g is not a distance" % value)
 
     if geographic:
@@ -291,6 +329,16 @@ def to_write(plans):
     return [p for p in plans if p.writes]
 
 
+def nothing_compared(plans):
+    """True when there were rows and not one of them had a geometry.
+
+    Such a run compared nothing, so it cannot call the layer clean. A file
+    exported without its geometry would otherwise pass a nightly check for
+    ever.
+    """
+    return bool(plans) and all(p.verdict == NO_GEOMETRY for p in plans)
+
+
 def describe(plans, tolerance, units_label, limit=DEFAULT_LIMIT):
     """The report, as lines. No printing here so the self-test can read it."""
     counts = summarize(plans)
@@ -300,19 +348,26 @@ def describe(plans, tolerance, units_label, limit=DEFAULT_LIMIT):
         lines.append("  %-12s %6d" % (verdict, counts[verdict]))
 
     moved = [p for p in plans if p.verdict in (DRIFT, FILL)]
-    if not moved:
-        lines.append("")
-        lines.append("Every stored coordinate agrees with its geometry.")
-        return lines
-
     lines.append("")
-    lines.append("rows whose columns disagree with their geometry:")
-    for plan in moved[:limit]:
-        lines.append("  OID %s %s: dx=%s dy=%s" % (
-            plan.oid, plan.verdict, _fmt(plan.dx), _fmt(plan.dy)))
-    if len(moved) > limit:
-        lines.append("  ... and %d more" % (len(moved) - limit))
+    if moved:
+        lines.append("rows whose columns disagree with their geometry:")
+        for plan in moved[:limit]:
+            lines.append("  OID %s %s: dx=%s dy=%s" % (
+                printable(plan.oid), plan.verdict, _fmt(plan.dx),
+                _fmt(plan.dy)))
+        if len(moved) > limit:
+            lines.append("  ... and %d more" % (len(moved) - limit))
+    elif nothing_compared(plans):
+        lines.append("No row has a geometry, so no stored coordinate was "
+                     "compared.")
+    elif counts[NO_GEOMETRY]:
+        lines.append("Every stored coordinate that has a geometry agrees "
+                     "with it.")
+    else:
+        lines.append("Every stored coordinate agrees with its geometry.")
 
+    # After every branch, not only the drift one. Behind an early return it
+    # printed only when drift was found as well.
     if counts[NO_GEOMETRY]:
         lines.append("")
         lines.append("%d row(s) have no geometry. Their stored coordinates are "
@@ -322,6 +377,20 @@ def describe(plans, tolerance, units_label, limit=DEFAULT_LIMIT):
 
 def _fmt(value):
     return "none" if value is None else "%g" % value
+
+
+def printable(value):
+    """Text of any value in printable ASCII, with the rest backslash-escaped.
+
+    A feature id or a file name can hold a character the console cannot
+    encode, and a lone surrogate that no encoding can. Printing either raw
+    stops the report part way with a traceback that exits 1, the code for
+    drift found. Control characters are ASCII and are escaped as well: a
+    newline in an id forges a report line, and ESC[8m hides the real one.
+    """
+    text = ("%s" % (value,)).encode("ascii", "backslashreplace").decode("ascii")
+    return "".join(c if " " <= c <= "~" else "\\x%02x" % ord(c)
+                   for c in text)
 
 
 def update_fields(x_field, y_field):
@@ -335,40 +404,397 @@ def update_fields(x_field, y_field):
     return ["OID@", x_field, y_field]
 
 
+def rounded(value):
+    """Geometry coordinate on the comparison grid, or None.
+
+    Round before comparing, not after. A geometry arrives as a full float64,
+    whose last bits differ from the value that was stored, and comparing those
+    bits is how a tolerance ends up being asked to hide arithmetic.
+    """
+    return None if value is None else round(value, GEOM_DECIMALS)
+
+
+def geometry_xy(gx, gy):
+    """The geometry pair on the grid, or (None, None) if it is not a point.
+
+    A pair with a NaN, an infinity or a missing axis has no position. It says
+    nothing about the stored columns, so it plans as NO_GEOMETRY and nothing
+    is written from it. Planned as numbers, a NaN geometry read as clean.
+    """
+    if gx is None or gy is None or not (math.isfinite(gx)
+                                        and math.isfinite(gy)):
+        return None, None
+    return rounded(gx), rounded(gy)
+
+
+def plan_rows(rows, tolerance, wrap):
+    """Plan each (oid, stored x, stored y, geometry x, geometry y) row.
+
+    The layer scan and the GeoJSON reader both end here, so the two inputs
+    cannot disagree about what counts as drift.
+    """
+    plans = []
+    for oid, sx, sy, gx, gy in rows:
+        gx, gy = geometry_xy(gx, gy)
+        plans.append(plan_row(oid, sx, sy, gx, gy, tolerance, wrap))
+    return plans
+
+
+def is_number(value):
+    """True for a finite JSON number. A JSON true or false is not one.
+
+    NaN is the case that bites. NaN minus anything is NaN, NaN is never
+    greater than a tolerance, and classify_pair therefore calls a NaN column
+    clean on every row.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        # An integer too large for a float.
+        return False
+
+
+def xy_crs_refusal(crs):
+    """Reason the stated system of the stored columns cannot be used, or None.
+
+    GeoJSON geometry is always lon/lat, and the standard library cannot
+    reproject. Columns in any other system would be compared in different
+    units on every row, which reports all of them as drift, correctly and
+    uselessly.
+    """
+    if crs is None:
+        return ("--from-geojson needs --xy-crs, the EPSG code the stored X "
+                "and Y columns are in. GeoJSON geometry is always WGS84 "
+                "lon/lat (EPSG:%d), so the columns can be compared with it "
+                "only if they are lon/lat too." % GEOJSON_WKID)
+    if crs != GEOJSON_WKID:
+        # NAD83 and NAD27 are lon/lat too, and are still refused. NAD27
+        # against WGS84 is tens of metres, which is the drift being hunted.
+        return ("--xy-crs %d: GeoJSON geometry is always WGS84 lon/lat "
+                "(EPSG:%d), and columns in any other system, another lon/lat "
+                "datum included, would be compared in the wrong frame. This "
+                "mode cannot reproject, so it will not compare them. Export "
+                "the columns in EPSG:%d, or run --layer with --wkid %d under "
+                "ArcGIS Pro." % (crs, GEOJSON_WKID, GEOJSON_WKID, crs))
+    return None
+
+
+def geojson_crs_refusal(doc, owner="the file"):
+    """Reason the geometry under doc is not lon/lat, or None.
+
+    RFC 7946 has no crs member. An older file may still carry one, and a
+    projected name there means the coordinates are feet or metres, whatever
+    the standard says they should be. The 2008 spec allowed it on a feature
+    and on a geometry as well, overriding the collection's, so feature_rows
+    asks this of both. owner names where the member was found.
+    """
+    crs = doc.get("crs") if isinstance(doc, dict) else None
+    if crs is None:
+        return None
+    props = crs.get("properties") if isinstance(crs, dict) else None
+    name = props.get("name") if isinstance(props, dict) else None
+    known = [n.upper() for n in LONLAT_CRS_NAMES]
+    if isinstance(name, str) and name.strip().upper() in known:
+        return None
+    return ("%s declares the crs %s. GeoJSON geometry has to "
+            "be WGS84 lon/lat to be compared here, and this mode cannot "
+            "reproject." % (owner, json.dumps(crs, sort_keys=True)))
+
+
+def point_xy(geometry, oid):
+    """Longitude and latitude of one GeoJSON point, or (None, None).
+
+    An absent geometry and an empty point both give (None, None), which
+    plans as NO_GEOMETRY and leaves the stored columns alone. Anything else
+    that is not a lon/lat point raises ValueError with the reason.
+    """
+    if geometry is None:
+        return None, None
+    kind = geometry.get("type") if isinstance(geometry, dict) else None
+    if kind != "Point":
+        raise ValueError("feature %s has a %s geometry. Only a point has one "
+                         "X and one Y to compare."
+                         % (printable(oid), printable(kind)))
+    coords = geometry.get("coordinates")
+    if coords == []:
+        return None, None
+    if (not isinstance(coords, list) or len(coords) < 2
+            or not (is_number(coords[0]) and is_number(coords[1]))):
+        raise ValueError("feature %s has point coordinates %s, which are not "
+                         "a position."
+                         % (printable(oid), json.dumps(coords)))
+    x, y = float(coords[0]), float(coords[1])
+    # Checked on the grid, so a writer's 180.00000000001 is still 180.
+    if abs(rounded(x)) > 180.0 or abs(rounded(y)) > 90.0:
+        raise ValueError("feature %s is at %r, %r, which is not lon/lat. The "
+                         "file was written in another system, and this mode "
+                         "cannot reproject." % (printable(oid), x, y))
+    return x, y
+
+
+def feature_rows(doc, x_field, y_field):
+    """Rows for plan_rows from a parsed GeoJSON document.
+
+    Each row is (oid, stored x, stored y, geometry x, geometry y). The OID is
+    the feature's id member, or its 1-based position when it has none. A
+    property that is absent reads as None, the same as a null. A column that
+    no feature carries at all is refused, because that is a misspelled name
+    and not a layer that was never populated.
+    """
+    kind = doc.get("type") if isinstance(doc, dict) else None
+    if kind == "Feature":
+        features = [doc]
+    elif kind == "FeatureCollection":
+        features = doc.get("features")
+    else:
+        raise ValueError("the file is not a GeoJSON FeatureCollection or "
+                         "Feature.")
+    if not isinstance(features, list):
+        raise ValueError("the FeatureCollection has no features list.")
+
+    if not features:
+        # A layer has a schema to check the names against. An empty file has
+        # none, so a misspelled column would pass, and a failed export would
+        # report as clean.
+        raise ValueError("the file has no features, so nothing can be "
+                         "checked and the columns %s and %s cannot be "
+                         "confirmed." % (printable(x_field), printable(y_field)))
+    rows = []
+    seen = set()
+    for index, feature in enumerate(features, 1):
+        if not isinstance(feature, dict) or feature.get("type") != "Feature":
+            raise ValueError("item %d in features is not a Feature." % index)
+        oid = feature.get("id", index)
+        props = feature.get("properties")
+        props = {} if props is None else props
+        if not isinstance(props, dict):
+            raise ValueError("feature %s has properties that are not an "
+                             "object." % printable(oid))
+        # A crs one level down was ignored, and NAD27 geometry compared with
+        # WGS84 columns read as clean.
+        for owner, obj in (("feature %s" % printable(oid), feature),
+                           ("the geometry of feature %s" % printable(oid),
+                            feature.get("geometry"))):
+            reason = geojson_crs_refusal(obj, owner)
+            if reason is not None:
+                raise ValueError(reason)
+        stored = []
+        for field in (x_field, y_field):
+            if field in props:
+                seen.add(field)
+            value = props.get(field)
+            if value is not None and not is_number(value):
+                raise ValueError("column %s holds %s on feature %s. A "
+                                 "coordinate has to be compared as a finite "
+                                 "number, and this one is not stored as one."
+                                 % (field, json.dumps(value),
+                                    printable(oid)))
+            stored.append(None if value is None else float(value))
+        gx, gy = point_xy(feature.get("geometry"), oid)
+        rows.append((oid, stored[0], stored[1], gx, gy))
+
+    for field in (x_field, y_field):
+        if field not in seen:
+            raise ValueError("column %s is not in the properties of any "
+                             "feature." % field)
+    return rows
+
+
+def lonlat_refusal(rows, x_field, y_field):
+    """Reason the stored columns are plainly not lon/lat, or None.
+
+    --xy-crs is the caller's word. When not one stored value in a column
+    could be a longitude or a latitude, the word was wrong: the columns are
+    in feet or metres and every row would read as drift. One wild value among
+    good ones is only a drifted row, and is reported as that.
+    """
+    for field, pos, limit in ((x_field, 1, 180.0), (y_field, 2, 90.0)):
+        values = [r[pos] for r in rows if r[pos] is not None]
+        if values and not any(abs(v) <= limit for v in values):
+            return ("column %s holds no value within +/-%g, so it is not in "
+                    "degrees, whatever --xy-crs says. Its first value is %r."
+                    % (field, limit, values[0]))
+    return None
+
+
+def geojson_rows(doc, x_field, y_field):
+    """Every check on a parsed file, then its rows. Raises ValueError."""
+    reason = geojson_crs_refusal(doc)
+    if reason is None:
+        rows = feature_rows(doc, x_field, y_field)
+        reason = lonlat_refusal(rows, x_field, y_field)
+    if reason is not None:
+        raise ValueError(reason)
+    return rows
+
+
+# ------------------------------------------------------------------ files
+
+def unique_names(pairs):
+    """One JSON object as a dict, refusing a name that appears twice.
+
+    Python keeps the last of two equal names without a word, and another
+    reader may keep the first. {"X": -82.4, "X": -82.3999} would then be
+    checked as whichever one happened to win.
+    """
+    obj = {}
+    for name, value in pairs:
+        if name in obj:
+            raise ValueError("the name %s appears twice in one object, so the "
+                             "file can be read two ways." % json.dumps(name))
+        obj[name] = value
+    return obj
+
+
+def load_geojson(path):
+    """Parse a GeoJSON file. Returns (document, modified time as UTC text).
+
+    ponytail: the whole file is parsed into memory, like the plans. Fine for
+    a few hundred thousand points; stream it if a file outgrows that.
+    """
+    with open(path, "rb") as handle:
+        text = handle.read().decode("utf-8-sig")
+    # Python's json accepts NaN and Infinity, which JSON does not. They are
+    # left in, and is_number refuses them where they matter: in the two
+    # columns and the geometry, and nowhere else in the file.
+    doc = json.loads(text, object_pairs_hook=unique_names)
+    try:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S UTC",
+                              time.gmtime(os.path.getmtime(path)))
+    except (OSError, OverflowError, ValueError):
+        # Windows cannot convert a time before 1970, a 32-bit time_t cannot
+        # hold a far-future one, and some platforms raise ValueError for
+        # either. The time is only a label, so the check still runs rather
+        # than exiting 1, the code for drift found.
+        stamp = "unknown"
+    return doc, stamp
+
+
+def same_field_refusal(args):
+    """Reason --x-field and --y-field cannot be used, or None.
+
+    One column read as both axes is compared with the longitude and the
+    latitude in turn, and --apply would write the latitude over it.
+    """
+    if args.x_field == args.y_field:
+        return ("--x-field and --y-field both name %s. They have to be two "
+                "columns." % printable(args.x_field))
+    return None
+
+
+def run_geojson(args):
+    """The whole --from-geojson run. Needs no arcpy and never writes."""
+    for flag, given, why in (
+            ("--apply", args.apply,
+             "A file is read, never written. A resync writes the layer "
+             "itself: run --layer with --apply under ArcGIS Pro."),
+            ("--workspace", args.workspace,
+             "There is no edit session on a file."),
+            ("--wkid", args.wkid != DEFAULT_WKID,
+             "State the system of the stored columns with --xy-crs.")):
+        if given:
+            print("error: %s does not apply to --from-geojson. %s"
+                  % (flag, why), file=sys.stderr)
+            return 64
+
+    reason = xy_crs_refusal(args.xy_crs) or same_field_refusal(args)
+    if reason is not None:
+        print("error: %s" % reason, file=sys.stderr)
+        return 64
+
+    tolerance = args.tolerance
+    units = args.tolerance_units
+    if tolerance is None:
+        tolerance = DEFAULT_TOLERANCE_DEGREES
+        units = "degrees"
+    try:
+        tolerance = resolve_tolerance(tolerance, units, True)
+    except ValueError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 64
+
+    try:
+        doc, stamp = load_geojson(args.from_geojson)
+        rows = geojson_rows(doc, args.x_field, args.y_field)
+    except (OSError, ValueError, RecursionError, MemoryError) as exc:
+        # RecursionError is a file nested too deep for the parser, and is
+        # not a ValueError. Uncaught, it would exit 1: drift found.
+        print("error: %s: %s" % (args.from_geojson, exc), file=sys.stderr)
+        return 64
+
+    plans = plan_rows(rows, tolerance, True)
+    # The time is the local file's, and a copy resets it unless the copy
+    # keeps it (scp -p, cp -p). The line says so, so nobody reads a year-old
+    # export, copied this morning, as fresh.
+    print("source: %s, file modified %s. That is the export time only if "
+          "every copy kept it. A file is a snapshot, not the live layer."
+          % (printable(args.from_geojson), stamp))
+    for line in describe(plans, tolerance, "degrees", args.limit):
+        print(line)
+    if nothing_compared(plans):
+        print("error: no feature has a geometry, so nothing was checked.",
+              file=sys.stderr)
+        return 64
+
+    pending = to_write(plans)
+    if not pending:
+        return 0
+    print("")
+    print("Check only. A GeoJSON file is never written. To resync %d row(s), "
+          "run --layer on the layer itself with --apply under ArcGIS Pro."
+          % len(pending))
+    return 1
+
+
 # ------------------------------------------------------------------ geodatabase
 
 def _import_arcpy():
     """Import arcpy only when a real feature class is about to be read."""
     try:
         import arcpy
+    except RuntimeError as exc:
+        # arcpy raises this on import when Pro cannot check out a licence.
+        print("error: arcpy is installed but could not start: %s. Sign in "
+              "to ArcGIS Pro or check its licence, then run again."
+              % printable(str(exc)), file=sys.stderr)
+        return None
     except ImportError:
-        sys.exit(
-            "arcpy was not found. Run this with the Python that ships with "
-            "ArcGIS Pro:\n"
-            '  "%s" xydrift.py\n'
-            "or the propy.bat in ...\\Pro\\bin\\Python\\Scripts\\.\n"
-            "Only --self-test runs without arcpy." % PRO_PYTHON
-        )
+        # Exit 3, not the 1 that sys.exit(message) gives. A scheduled check
+        # run under the wrong Python must not report drift found every night.
+        print("error: arcpy was not found. Run this with the Python that "
+              "ships with ArcGIS Pro:\n"
+              '  "%s" xydrift.py\n'
+              "or the propy.bat in ...\\Pro\\bin\\Python\\Scripts\\.\n"
+              "Only --self-test and --from-geojson run without arcpy."
+              % PRO_PYTHON, file=sys.stderr)
+        return None
     return arcpy
 
 
-def layer_magnitude(arcpy, layer, geographic):
-    """Largest coordinate this layer can hold, for the Single-precision check.
+def layer_magnitude(arcpy, layer, sr, geographic):
+    """Largest coordinate this layer holds in sr, for the Single-precision check.
 
-    A geographic layer is bounded by the globe, so 180 is the worst case and no
-    read is needed. A projected one has no such bound, and a Single column's
-    step grows with the coordinate: near 600000 ft it is 0.0625 ft, coarser
-    than any tolerance worth using. The extent is stored metadata, so asking
-    for it costs no second pass over the rows.
+    sr is --wkid, the system the stored columns are compared in. A geographic
+    one is bounded by the globe, so 180 is the worst case and no read is
+    needed. A projected one has no such bound, and a Single column's step
+    grows with the coordinate: near 600000 ft it is 0.0625 ft, coarser than
+    any tolerance worth using. The extent is stored metadata, so asking for it
+    costs no second pass over the rows.
+
+    The extent is projected into sr first. Describe reports it in the layer's
+    own system, and a lon/lat layer with Single columns in state plane feet
+    read as magnitude 82: the check passed, and every row drifted for ever.
     """
     if geographic:
         return 180.0
-    extent = arcpy.Describe(layer).extent
+    extent = arcpy.Describe(layer).extent.projectAs(sr)
     corners = [abs(v) for v in
                (extent.XMin, extent.XMax, extent.YMin, extent.YMax)
-               if v is not None]
-    # An empty layer reports no extent. It also has no row that can be wrong,
-    # so a magnitude of zero refuses nothing.
+               if is_number(v)]
+    # An empty layer reports its corners as NaN. It also has no row that can
+    # be wrong, so a magnitude of zero refuses nothing.
     return max(corners) if corners else 0.0
 
 
@@ -389,17 +815,10 @@ def scan(arcpy, layer, x_field, y_field, sr, tolerance, wrap):
     OID range if a layer outgrows it.
     """
     fields = ["OID@", x_field, y_field, "SHAPE@X", "SHAPE@Y"]
-    plans = []
     with arcpy.da.SearchCursor(layer, fields, spatial_reference=sr) as cursor:
-        for oid, sx, sy, gx, gy in cursor:
-            # Round before comparing, not after. The geometry token returns the
-            # full float64 projection of the point, whose last bits differ from
-            # the value that was stored, and comparing those bits is how a
-            # tolerance ends up being asked to hide arithmetic.
-            gx = None if gx is None else round(gx, GEOM_DECIMALS)
-            gy = None if gy is None else round(gy, GEOM_DECIMALS)
-            plans.append(plan_row(oid, sx, sy, gx, gy, tolerance, wrap))
-    return plans
+        # The geometry token returns the full float64 projection of the
+        # point. plan_rows rounds it to the grid before any comparison.
+        return plan_rows(cursor, tolerance, wrap)
 
 
 def resync(arcpy, layer, plans, x_field, y_field, workspace=None):
@@ -445,48 +864,16 @@ def resync(arcpy, layer, plans, x_field, y_field, workspace=None):
 
 def run(args, arcpy):
     """The whole run once arcpy exists. Separate from main so a stub can drive it."""
-    if not arcpy.Exists(args.layer):
-        print("error: layer does not exist: %s" % args.layer, file=sys.stderr)
-        return 64
-
-    sr, geographic, meters_per_unit, types = layer_profile(
-        arcpy, args.layer, args.wkid)
-
-    tolerance = args.tolerance
-    units = args.tolerance_units
-    if tolerance is None:
-        if not geographic:
-            print("error: a projected layer has no sane default tolerance. "
-                  "Pass --tolerance in the layer's own linear units.",
-                  file=sys.stderr)
-            return 64
-        tolerance = DEFAULT_TOLERANCE_DEGREES
-        units = "degrees"
     try:
-        tolerance = resolve_tolerance(tolerance, units, geographic,
-                                      meters_per_unit)
-    except ValueError as exc:
-        print("error: %s" % exc, file=sys.stderr)
-        return 64
-
-    for field in (args.x_field, args.y_field):
-        if field not in types:
-            print("error: column %s is not in %s" % (field, args.layer),
-                  file=sys.stderr)
-            return 64
-
-    magnitude = layer_magnitude(arcpy, args.layer, geographic)
-    for field in (args.x_field, args.y_field):
-        reason = refuse_coord_field(field, types[field], tolerance, magnitude)
-        if reason is not None:
-            print("error: %s" % reason, file=sys.stderr)
-            return 64
-
-    units_label = "degrees" if geographic else "linear units"
-    plans = scan(arcpy, args.layer, args.x_field, args.y_field, sr,
-                 tolerance, geographic)
-    for line in describe(plans, tolerance, units_label, args.limit):
-        print(line)
+        code, plans = check_layer(args, arcpy)
+    except Exception as exc:
+        # A bad --wkid, a dropped connection or a schema lock raises from
+        # arcpy. Uncaught, that traceback exits 1, which reads as drift found.
+        print("error: reading %s failed: %s. Nothing was written."
+              % (args.layer, exc), file=sys.stderr)
+        return 3
+    if code is not None:
+        return code
 
     pending = to_write(plans)
     if not pending:
@@ -510,6 +897,65 @@ def run(args, arcpy):
     return 0
 
 
+def check_layer(args, arcpy):
+    """The read pass: every refusal, the scan and the report. Writes nothing.
+
+    Returns (exit code, None) for a refusal, or (None, plans).
+    """
+    reason = same_field_refusal(args)
+    if reason is not None:
+        print("error: %s" % reason, file=sys.stderr)
+        return 64, None
+    if not arcpy.Exists(args.layer):
+        print("error: layer does not exist: %s" % args.layer, file=sys.stderr)
+        return 64, None
+
+    sr, geographic, meters_per_unit, types = layer_profile(
+        arcpy, args.layer, args.wkid)
+
+    tolerance = args.tolerance
+    units = args.tolerance_units
+    if tolerance is None:
+        if not geographic:
+            print("error: a projected layer has no sane default tolerance. "
+                  "Pass --tolerance in the layer's own linear units.",
+                  file=sys.stderr)
+            return 64, None
+        tolerance = DEFAULT_TOLERANCE_DEGREES
+        units = "degrees"
+    try:
+        tolerance = resolve_tolerance(tolerance, units, geographic,
+                                      meters_per_unit)
+    except ValueError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 64, None
+
+    for field in (args.x_field, args.y_field):
+        if field not in types:
+            print("error: column %s is not in %s" % (field, args.layer),
+                  file=sys.stderr)
+            return 64, None
+
+    magnitude = layer_magnitude(arcpy, args.layer, sr, geographic)
+    for field in (args.x_field, args.y_field):
+        reason = refuse_coord_field(field, types[field], tolerance, magnitude)
+        if reason is not None:
+            print("error: %s" % reason, file=sys.stderr)
+            return 64, None
+
+    units_label = "degrees" if geographic else "linear units"
+    plans = scan(arcpy, args.layer, args.x_field, args.y_field, sr,
+                 tolerance, geographic)
+    for line in describe(plans, tolerance, units_label, args.limit):
+        print(line)
+    if nothing_compared(plans):
+        print("error: no row has a geometry, so nothing was checked.",
+              file=sys.stderr)
+        return 64, None
+
+    return None, plans
+
+
 # ------------------------------------------------------------------ self-test
 
 class _StubField(object):
@@ -521,13 +967,22 @@ class _StubField(object):
 
 
 class _StubExtent(object):
-    """arcpy's extent object in the four corners this tool reads."""
+    """arcpy's extent object in the four corners and the one method used here.
 
-    def __init__(self, xmin, ymin, xmax, ymax):
+    The corners are in the layer's own system, 4326. projectAs knows only the
+    systems a test names, so code that reads the corners without projecting
+    them gets the lon/lat numbers, as it would from real arcpy.
+    """
+
+    def __init__(self, xmin, ymin, xmax, ymax, projections=None):
         self.XMin = xmin
         self.YMin = ymin
         self.XMax = xmax
         self.YMax = ymax
+        self._projections = dict(projections or {})
+
+    def projectAs(self, sr):
+        return self._projections[sr.factoryCode]
 
 
 class _StubDescribe(object):
@@ -657,7 +1112,9 @@ class _StubArcpy(object):
         self.opened = []
         # What Describe reports. A test that wants state plane magnitudes
         # replaces it rather than restating every row.
-        self.extent = _StubExtent(-82.7, 29.2, -82.1, 29.8)
+        # The rows hold 2237 geometry at 1000 times the lon/lat.
+        self.extent = _StubExtent(-82.7, 29.2, -82.1, 29.8, {
+            2237: _StubExtent(-82700.0, 29200.0, -82100.0, 29800.0)})
         self.da = _StubDa(self)
 
     def Exists(self, path):
@@ -698,6 +1155,20 @@ def _stub_rows():
     ]
 
 
+def _stub_geojson(rows=None):
+    """The same seven rows as a GeoJSON FeatureCollection, as a file holds them."""
+    features = []
+    for row in _stub_rows() if rows is None else rows:
+        geom = row["geom"]
+        features.append({
+            "type": "Feature", "id": row["OBJECTID"],
+            "geometry": None if geom is None else {
+                "type": "Point", "coordinates": list(geom[4326])},
+            "properties": {"X": row["X"], "Y": row["Y"],
+                           "LABEL": row["LABEL"]}})
+    return {"type": "FeatureCollection", "features": features}
+
+
 def _args(**kwargs):
     """Parsed arguments for a stub run, with the defaults filled in."""
     argv = ["--layer", _StubArcpy.FC]
@@ -705,16 +1176,13 @@ def _args(**kwargs):
         flag = "--" + key.replace("_", "-")
         if value is True:
             argv.append(flag)
-        elif value is not None:
+        else:
             argv.extend([flag, str(value)])
     return _parse(argv)
 
 
-def self_test():
-    """Assertions over the decision core. No arcpy, no database, no network."""
-    import contextlib
-    import io
-
+def _harness():
+    """check() and raises(), and the pass count and failure list they share."""
     passed = [0]
     failed = []
 
@@ -726,15 +1194,38 @@ def self_test():
             failed.append(label)
             print("FAIL  %s" % label)
 
-    def raises(fn, label):
+    def raises(fn, label, kind=ValueError):
         try:
             fn()
-        except ValueError:
+        except kind:
             check(True, label)
         except Exception as exc:
             check(False, "%s (wrong exception %r)" % (label, exc))
         else:
             check(False, "%s (no error raised)" % label)
+
+    return check, raises, passed, failed
+
+
+def _footer(passed, failed):
+    """The self-test's closing lines and its exit code."""
+    total = passed + len(failed)
+    if not failed:
+        return ["%d assertions, 0 failed" % total], 0
+    return (["%d assertions, %d failed" % (total, len(failed))]
+            + ["  FAILED: %s" % f for f in failed]), 1
+
+
+def self_test():
+    """Assertions over the decision core. No arcpy, no database, no network."""
+    import contextlib
+    import io
+    import shutil
+    import tempfile
+    from types import ModuleType
+    from unittest import mock
+
+    check, raises, passed, failed = _harness()
 
     def run_stub(stub, **kwargs):
         """run() against the stub, returning (exit code, printed text)."""
@@ -743,6 +1234,9 @@ def self_test():
             with contextlib.redirect_stderr(out):
                 code = run(_args(**kwargs), stub)
         return code, out.getvalue()
+
+    def is_ascii(text):
+        return all(ord(c) < 128 for c in text)
 
     print("xydrift self-test: no arcpy, no database, no network")
     print("-" * 68)
@@ -758,10 +1252,44 @@ def self_test():
     check(abs(wrapped_delta(179.9999995, -179.9999995) - 1e-6) < 1e-12,
           "two points either side of the antimeridian are 1e-6 degrees apart")
     check(wrapped_delta(-82.1, -82.1) == 0.0, "wrapping leaves an ordinary pair alone")
-    check(wrapped_delta(0.0, 400.0) == 40.0,
-          "a difference over 360 wraps to 40 and never comes back negative")
-    check(wrapped_delta(0.0, 200.0) == 160.0, "a 200 degree gap measures 160 the short way")
+    check(wrapped_delta(-95.0, 90.0) == 175.0,
+          "a 185 degree gap measures 175, so the fold is at exactly 180")
+    check(wrapped_delta(-180.0, 0.5) == 179.5,
+          "a 180.5 degree gap measures 179.5, so the fold is at 180 and not "
+          "past it")
+    check(wrapped_delta(82.2, -277.8) == 360.0,
+          "a geometry X past -180 is measured plainly too, not wrapped")
+    check(plan_row(1, 180.000009, 10.0, -179.999992, 10.0, tol, True).dx
+          == 360.000001,
+          "a stored X 9e-6 past 180 is outside the tolerance of the meridian, "
+          "so it is measured plainly and not wrapped")
+    check(wrapped_delta(-100.0, 100.0) == 160.0,
+          "a 200 degree gap measures 160 the short way")
+    check(wrapped_delta(0.0, 400.0) == 400.0,
+          "a value past 180 is not wrapped, so 400 against 0 measures 400")
+    check(wrapped_delta(-7282.2, -82.2) > 7000.0,
+          "a stored X twenty whole turns off is not the same meridian  <-- pinned defect")
+    check(wrapped_delta(277.8, -82.2) == 360.0,
+          "277.8 in the 0-360 convention is 360 from -82.2, not a match  <-- pinned defect")
+    check(wrapped_delta(180.000000001, -180.0) < 1e-8,
+          "a writer's noise past 180 is still wrapped, because the seam is "
+          "tested on the rounding grid")
     check(delta(0.0, 400.0) == 400.0, "without wrapping the same pair measures 400")
+    check(wrapped_delta(180.0000001, -180.0, tol) < tol,
+          "a stored X 1e-7 past 180 is inside the tolerance of the meridian, "
+          "so it still wraps  <-- pinned defect")
+    seam_plans = [plan_row(1, 180.0000001, 10.0, gx, 10.0, tol, True)
+                  for gx in (-180.0, 180.0)]
+    check(all(p.verdict == OK and p.dx < tol for p in seam_plans),
+          "the same stored X past the seam is OK against -180 and +180 "
+          "alike, and measures 1e-7 on both  <-- pinned defect")
+    seam = _StubArcpy([{"OBJECTID": 1, "X": 180.0000001, "Y": 10.0,
+                        "LABEL": "a", "geom": {4326: (-180.0, 10.0)}}])
+    code, _ = run_stub(seam, apply=True)
+    check(code == 0 and seam.updates == 0
+          and seam.rows[1]["X"] == 180.0000001,
+          "--apply leaves that row alone, so it stamps no editor tracking  "
+          "<-- pinned defect")
 
     # ---- the two null branches, which decide whether a row survives
     check(classify_pair(None, None, tol) == NO_GEOMETRY,
@@ -799,6 +1327,10 @@ def self_test():
     check(manufactured == [],
           "rounding the geometry to 8 decimals never manufactures drift at 1e-6  <-- pinned defect")
     check(rounding_floor() == 1e-8, "the rounding grid is 1e-8 degrees")
+    check(plan_rows([(1, -82.1, 10.0, -82.10004, 10.0)], tol, True)[0].verdict
+          == DRIFT,
+          "a 4 m move survives the rounding, so the grid is 8 decimals and "
+          "not fewer")
     check(rounding_floor(2) == 0.01, "the grid follows the decimals it is given")
 
     # ---- measure reports the distance, not the verdict
@@ -815,6 +1347,14 @@ def self_test():
           "a row with no geometry is reported as that, not as drift")
     check(worst(FILL, OK) == FILL, "a column to fill outranks a clean one")
     check(worst(OK, OK) == OK, "two clean columns make a clean row")
+    check(worst(FILL, DRIFT) == DRIFT and worst(DRIFT, FILL) == DRIFT,
+          "a drifted column outranks one to fill, in either order")
+    check(plan_row(1, -82.4, None, -82.3999, 29.5, tol, True).verdict == DRIFT,
+          "a row with a drifted X and an empty Y is counted as DRIFT")
+    upside = plan_row(1, 0.0, 180.0, 0.0, -180.0, tol, True)
+    check(upside.verdict == DRIFT and upside.dy == 360.0,
+          "latitude is never wrapped, even with wrapping on, so a Y of 180 "
+          "against -180 is 360 apart")
     raises(lambda: worst(), "an empty verdict list is refused")
 
     clean = plan_row(1, -82.1, 29.2, -82.1, 29.2, tol)
@@ -891,6 +1431,14 @@ def self_test():
            "a negative tolerance is refused")
     raises(lambda: resolve_tolerance(None, "degrees", True),
            "a missing tolerance is refused")
+    raises(lambda: resolve_tolerance(float("nan"), "degrees", True),
+           "a NaN tolerance is refused, because no drift is ever greater "
+           "than it  <-- pinned defect")
+    raises(lambda: resolve_tolerance(float("inf"), None, True),
+           "an infinite tolerance is refused  <-- pinned defect")
+    raises(lambda: resolve_tolerance(float("1e400"), None, False, 1.0),
+           "1e400, which reads as infinity, is refused on a projected layer "
+           "too")
     raises(lambda: resolve_tolerance(1e-9, "degrees", True),
            "a tolerance under the 1e-8 rounding grid is refused  <-- pinned defect")
     raises(lambda: resolve_tolerance(1e-8, "degrees", True),
@@ -975,6 +1523,9 @@ def self_test():
           "past the limit the report says how many more there are")
     check("... and 13 more" in "\n".join(describe(many, tol, "degrees", 1)),
           "the limit is the number it was given")
+    check("... and" not in "\n".join(describe(many[:3], tol, "degrees", 3)),
+          "exactly as many rows as the limit need no truncation line, not "
+          "an '... and 0 more'")
     listed = [l for l in describe(many, tol, "degrees", 3) if l.startswith("  OID")]
     check(len(listed) == 3,
           "the limit is how many rows are listed, not only what the tail line "
@@ -982,8 +1533,38 @@ def self_test():
     clean_text = "\n".join(describe(plans[:3], tol, "degrees"))
     check("Every stored coordinate agrees" in clean_text,
           "a clean layer gets a sentence, not an empty list")
+    mixed_text = "\n".join(describe([plans[0], plans[5]], tol, "degrees"))
+    check("1 row(s) have no geometry" in mixed_text,
+          "a clean report still counts the rows it could not compare  <-- pinned defect")
+    check("Every stored coordinate that has a geometry agrees" in mixed_text
+          and "agrees with its geometry" not in mixed_text,
+          "and does not claim that every coordinate agrees")
+    shapeless_text = "\n".join(describe([plans[5], plans[5]], tol, "degrees"))
+    check("no stored coordinate was compared" in shapeless_text
+          and "agrees" not in shapeless_text
+          and "2 row(s) have no geometry" in shapeless_text,
+          "rows that all lack a geometry are reported as not compared, not as "
+          "clean  <-- pinned defect")
+    check(nothing_compared([plans[5]]) and not nothing_compared(plans)
+          and not nothing_compared([]),
+          "nothing was compared only when there were rows and none had a "
+          "geometry")
     check(_fmt(None) == "none" and _fmt(0.0001) == "0.0001",
           "a measured drift prints as a number and an absent one as none")
+    check(printable(4) == "4" and printable("a-1") == "a-1",
+          "an ordinary id prints as itself")
+    check(printable(u"\u6771\ud800") == "\\u6771\\ud800",
+          "a CJK id and a lone surrogate print escaped in pure ASCII")
+    check(printable("4\n\r\t\x1b[8m\x7f~") == "4\\x0a\\x0d\\x09\\x1b[8m\\x7f~",
+          "newline, CR, tab, ESC and DEL in an id print escaped, so an id "
+          "cannot forge or hide a report line  <-- pinned defect")
+    odd = [plan_row(u"\u6771\u4eac", -82.4, 29.5, -82.3999, 29.5, tol),
+           plan_row(u"\ud800", -82.4, 29.5, -82.3999, 29.5, tol)]
+    odd_text = "\n".join(describe(odd, tol, "degrees"))
+    check("OID \\u6771\\u4eac DRIFT" in odd_text
+          and "OID \\ud800 DRIFT" in odd_text and is_ascii(odd_text),
+          "the report prints ids no console can encode as escapes, not as a "
+          "traceback  <-- pinned defect")
 
     # ---- the writing cursor
     check("SHAPE@X" not in update_fields("X", "Y")
@@ -1004,19 +1585,30 @@ def self_test():
           "2237 profiles as projected and reports its metres per unit")
 
     # ---- the magnitude the Single check is made against
-    check(layer_magnitude(stub, _StubArcpy.FC, True) == 180.0,
+    sr2237 = stub.SpatialReference(2237)
+
+    def state_plane_extent():
+        """A lon/lat layer whose extent in 2237 is state plane feet."""
+        return _StubExtent(-82.7, 29.2, -82.1, 29.8, {2237: _StubExtent(
+            560000.0, 1740000.0, 640000.0, 1890000.0)})
+
+    check(layer_magnitude(stub, _StubArcpy.FC, sr, True) == 180.0,
           "a geographic layer is bounded by the globe, so nothing is read")
-    check(layer_magnitude(stub, _StubArcpy.FC, False) == 82.7,
-          "a projected layer reports the largest corner of its own extent")
+    check(layer_magnitude(stub, _StubArcpy.FC, sr2237, False) == 82700.0,
+          "a projected --wkid reports the largest corner of the extent in "
+          "that system, not the layer's own lon/lat corners  <-- pinned defect")
     wide = _StubArcpy(_stub_rows())
-    wide.extent = _StubExtent(560000.0, 1740000.0, 640000.0, 1890000.0)
-    check(layer_magnitude(wide, _StubArcpy.FC, False) == 1890000.0,
+    wide.extent = state_plane_extent()
+    check(layer_magnitude(wide, _StubArcpy.FC, sr2237, False) == 1890000.0,
           "a state plane extent reports its largest coordinate, not its "
           "easting  <-- pinned defect")
+    nan = float("nan")
     empty_extent = _StubArcpy(_stub_rows())
-    empty_extent.extent = _StubExtent(None, None, None, None)
-    check(layer_magnitude(empty_extent, _StubArcpy.FC, False) == 0.0,
-          "an empty layer reports no extent and refuses no column for it")
+    empty_extent.extent = _StubExtent(nan, nan, nan, nan, {
+        2237: _StubExtent(nan, nan, nan, nan)})
+    check(layer_magnitude(empty_extent, _StubArcpy.FC, sr2237, False) == 0.0,
+          "an empty layer reports NaN corners, as real arcpy does, and "
+          "refuses no column for them  <-- pinned defect")
 
     scanned = scan(stub, _StubArcpy.FC, "X", "Y", sr, tol, True)
     check(len(scanned) == 7, "the scan reads every row once")
@@ -1100,12 +1692,9 @@ def self_test():
     plans = scan(stub, _StubArcpy.FC, "X", "Y", stub.SpatialReference(4326),
                  tol, True)
     stub.fail_write = True
-    try:
-        resync(stub, _StubArcpy.FC, plans, "X", "Y", workspace="stub.gdb")
-    except RuntimeError:
-        check(True, "a refused write is raised, not swallowed")
-    else:
-        check(False, "a refused write is raised, not swallowed")
+    raises(lambda: resync(stub, _StubArcpy.FC, plans, "X", "Y",
+                          workspace="stub.gdb"),
+           "a refused write is raised, not swallowed", RuntimeError)
     check("abortOperation" in stub.editor_calls,
           "a refused write aborts the edit operation")
     check(stub.editor_calls[-1] == "stopEditing(False)",
@@ -1117,12 +1706,9 @@ def self_test():
     plans = scan(stub, _StubArcpy.FC, "X", "Y", stub.SpatialReference(4326),
                  tol, True)
     stub.fail_write = True
-    try:
-        resync(stub, _StubArcpy.FC, plans, "X", "Y")
-    except RuntimeError:
-        check(True, "a refused write without an edit session is raised too")
-    else:
-        check(False, "a refused write without an edit session is raised too")
+    raises(lambda: resync(stub, _StubArcpy.FC, plans, "X", "Y"),
+           "a refused write without an edit session is raised too",
+           RuntimeError)
 
     # ---- end to end through run()
     stub = _StubArcpy(_stub_rows())
@@ -1182,6 +1768,17 @@ def self_test():
     check(code == 1 and "linear units" in out,
           "a projected layer with an explicit tolerance runs and reports "
           "linear units")
+    stub = _StubArcpy(_stub_rows())
+    code, out = run_stub(stub, tolerance="nan", apply=True)
+    check(code == 64 and "not a distance" in out and stub.updates == 0,
+          "--tolerance nan with --apply is refused before anything is "
+          "written, instead of reporting a clean layer  <-- pinned defect")
+    stub = _StubArcpy(_stub_rows())
+    code, out = run_stub(stub, wkid=3857, tolerance=1.0, apply=True)
+    check(code == 3 and "reading stub.gdb/Points failed" in out
+          and "Nothing was written" in out and stub.updates == 0,
+          "an arcpy error while the layer is read exits 3, not the 1 that "
+          "means drift found  <-- pinned defect")
 
     stub = _StubArcpy(_stub_rows())
     code, out = run_stub(stub, x_field="LON")
@@ -1189,20 +1786,21 @@ def self_test():
     # A Single easting column in state plane feet, checked to a hundredth of a
     # foot. The column's own step is 0.0625 ft, so every row would read as
     # drifted for ever, and no tolerance the caller can pick changes that.
+    # The layer itself is lon/lat, and the columns hold state plane feet.
     single = _StubArcpy(_stub_rows(),
                         types={"OBJECTID": "OID", "X": "Single",
                                "Y": "Single", "LABEL": "String"})
-    single.extent = _StubExtent(560000.0, 1740000.0, 640000.0, 1890000.0)
+    single.extent = state_plane_extent()
     code, out = run_stub(single, wkid=2237, tolerance=0.01)
     check(code == 64 and "coarser than the tolerance" in out,
-          "a Single column on a projected layer is refused from the layer's "
-          "own extent  <-- pinned defect")
+          "a Single column is refused from the extent in --wkid, on a lon/lat "
+          "layer whose columns hold state plane feet  <-- pinned defect")
     check(single.opened == [],
           "and that refusal also happens before any cursor opens")
     single = _StubArcpy(_stub_rows(),
                         types={"OBJECTID": "OID", "X": "Single",
                                "Y": "Single", "LABEL": "String"})
-    single.extent = _StubExtent(560000.0, 1740000.0, 640000.0, 1890000.0)
+    single.extent = state_plane_extent()
     code, out = run_stub(single, wkid=2237, tolerance=1.0)
     check(code == 1, "the same layer at a one foot tolerance runs")
 
@@ -1213,12 +1811,667 @@ def self_test():
     check(stub.opened == [],
           "and the refusal happens before the layer is read  <-- pinned defect")
 
+    nan_rows = _stub_rows()[:3]
+    nan_rows[1]["X"] = float("nan")
+    code, out = run_stub(_StubArcpy(nan_rows))
+    check(code == 1 and "OID 2 DRIFT: dx=nan" in out
+          and "Every stored" not in out,
+          "a NaN column read from a layer is drift and exits 1, not a clean "
+          "layer  <-- pinned defect")
+    nan_stub = _StubArcpy(nan_rows)
+    code, out = run_stub(nan_stub, apply=True)
+    check(code == 0 and nan_stub.rows[2]["X"] == -82.2
+          and nan_stub.rows[2]["Y"] == 29.3 and nan_stub.updates == 1,
+          "and --apply writes the geometry's X over the NaN and nothing else")
+    nan_geom = _stub_rows()[:1]
+    nan_geom[0]["X"] = -99.0
+    nan_geom[0]["geom"] = {4326: (float("nan"), float("nan"))}
+    code, out = run_stub(_StubArcpy(nan_geom))
+    check(code == 64 and "NO_GEOMETRY       1" in out
+          and "nothing was checked" in out and "Every stored" not in out,
+          "a layer whose only point is NaN compared nothing, and exits 64, "
+          "not 0  <-- pinned defect")
+    shapeless_stub = _StubArcpy(_stub_rows()[5:6])
+    code, out = run_stub(shapeless_stub, apply=True)
+    check(code == 64 and "no stored coordinate was compared" in out
+          and shapeless_stub.updates == 0,
+          "a layer with no geometry on any row exits 64 and writes nothing, "
+          "even with --apply  <-- pinned defect")
+
     missing = _StubArcpy(_stub_rows())
     out = io.StringIO()
     with contextlib.redirect_stderr(out):
         code = run(_parse(["--layer", "nowhere.gdb/Points"]), missing)
     check(code == 64 and "does not exist" in out.getvalue(),
           "a layer that does not exist is refused")
+
+    # ---- the GeoJSON reader, pure parts first
+    check(rounded(None) is None, "absent geometry stays absent on the grid")
+    check(rounded(-82.100000004) == -82.1,
+          "a geometry coordinate is rounded to the 8 decimal grid")
+    check(is_number(1.5) and is_number(-82), "a float and an integer are numbers")
+    check(not is_number(True), "a JSON true is not a coordinate")
+    check(not is_number("-82.1"), "a numeric string is not a number")
+    check(not is_number(None), "a null is not a number")
+    check(not is_number(float("nan")) and not is_number(float("inf")),
+          "NaN and infinity are not finite numbers")
+    check(not is_number(10 ** 400),
+          "an integer too large for a float is refused, not overflowed")
+    check(classify_pair(float("nan"), -82.1, tol) == DRIFT,
+          "the core calls a NaN column drift, not clean, so no reader has "
+          "to remember to refuse it  <-- pinned defect")
+    nan_row = plan_row(1, float("nan"), 29.2, -82.1, 29.2, tol, True)
+    check(nan_row.verdict == DRIFT and nan_row.new_x == -82.1
+          and nan_row.new_y is None,
+          "a NaN X with wrapping on is drift, and the resync would write the "
+          "geometry's X over it")
+    check(classify_pair(float("inf"), -82.1, tol, True) == DRIFT,
+          "an infinite column is drift as well")
+    check(geometry_xy(float("nan"), float("nan")) == (None, None),
+          "a NaN geometry is no geometry, not a clean row  <-- pinned defect")
+    check(geometry_xy(float("nan"), 29.2) == (None, None)
+          and geometry_xy(-82.1, float("inf")) == (None, None)
+          and geometry_xy(None, 29.2) == (None, None)
+          and geometry_xy(-82.1, None) == (None, None),
+          "a geometry with one axis missing or not finite is no geometry "
+          "either, so no half of it is written")
+    check(geometry_xy(-82.100000004, 29.2) == (-82.1, 29.2),
+          "a finite geometry is rounded to the grid")
+
+    check(unique_names([("X", 1.0), ("Y", 2.0)]) == {"X": 1.0, "Y": 2.0},
+          "an object with distinct names reads as a dict")
+    raises(lambda: unique_names([("X", -82.4), ("Y", 29.5), ("X", -82.3999)]),
+           "a name that appears twice in one object is refused  <-- pinned defect")
+
+    check(xy_crs_refusal(4326) is None, "--xy-crs 4326 is accepted")
+    no_crs = xy_crs_refusal(None)
+    check(no_crs is not None and "--xy-crs" in no_crs,
+          "a file run with no stated column system is refused and says which "
+          "flag to add")
+    state_plane = xy_crs_refusal(2237)
+    check(state_plane is not None and "cannot reproject" in state_plane,
+          "stored columns in state plane are refused, not compared with "
+          "lon/lat geometry  <-- pinned defect")
+    check("2237" in state_plane, "the refusal names the code it was given")
+    check(xy_crs_refusal(3857) is not None,
+          "web mercator metres are refused as well")
+    check(xy_crs_refusal(4269) is not None and xy_crs_refusal(4267) is not None,
+          "NAD83 and NAD27 lon/lat are refused too, because they are not the "
+          "WGS84 the geometry is in and nothing here shifts a datum  <-- pinned defect")
+
+    check(geojson_crs_refusal({"type": "FeatureCollection"}) is None,
+          "a file with no crs member is RFC 7946 lon/lat")
+    check(geojson_crs_refusal({"crs": {"type": "name", "properties": {
+        "name": "urn:ogc:def:crs:OGC:1.3:CRS84"}}}) is None,
+          "the CRS84 name GDAL writes is accepted")
+    check(geojson_crs_refusal({"crs": {"type": "name", "properties": {
+        "name": " epsg:4326 "}}}) is None,
+          "the name is compared without regard to case or spaces")
+    projected_crs = geojson_crs_refusal({"crs": {"type": "name", "properties": {
+        "name": "urn:ogc:def:crs:EPSG::2237"}}})
+    check(projected_crs is not None and "2237" in projected_crs,
+          "a file that declares projected geometry is refused  <-- pinned defect")
+    check(geojson_crs_refusal({"crs": {"type": "link", "properties": {
+        "href": "http://example.invalid/crs"}}}) is not None,
+          "a linked crs that names nothing is refused")
+    check(geojson_crs_refusal({"crs": "EPSG:2237"}) is not None,
+          "a crs member that is only a string is refused")
+    check(geojson_crs_refusal({"crs": {"type": "name", "properties": {
+        "name": "EPSG:43260"}}}) is not None,
+          "a name that only starts with a lon/lat name is refused, so the "
+          "match is whole")
+    check(geojson_crs_refusal([]) is None,
+          "a document that is not an object has no crs to refuse here")
+
+    check(point_xy(None, 1) == (None, None), "a null geometry has no X or Y")
+    check(point_xy({"type": "Point", "coordinates": []}, 1) == (None, None),
+          "an empty point has no X or Y either")
+    check(point_xy({"type": "Point", "coordinates": [-82.1, 29.2]}, 1)
+          == (-82.1, 29.2), "a point gives its longitude and latitude")
+    check(point_xy({"type": "Point", "coordinates": [-82.1, 29.2, 12.0]}, 1)
+          == (-82.1, 29.2), "a third coordinate is height and is ignored")
+    whole = point_xy({"type": "Point", "coordinates": [-82, 29]}, 1)
+    check(whole == (-82.0, 29.0) and isinstance(whole[0], float),
+          "integer coordinates are read as floats")
+    check(point_xy({"type": "Point", "coordinates": [180.00000000001, 0]},
+                   1)[0] == 180.00000000001,
+          "a writer's noise past 180 is still on the meridian, not refused")
+    check(point_xy({"type": "Point", "coordinates": [-180, -90]}, 1)
+          == (-180.0, -90.0), "the corners of the globe are positions")
+    raises(lambda: point_xy({"type": "LineString", "coordinates": []}, 3),
+           "a line is refused, because only a point has one X and one Y")
+    raises(lambda: point_xy("POINT (1 2)", 3),
+           "a geometry that is not an object is refused")
+    raises(lambda: point_xy({"type": "Point", "coordinates": [1]}, 3),
+           "a point with one coordinate is refused")
+    raises(lambda: point_xy({"type": "Point", "coordinates": "1 2"}, 3),
+           "point coordinates that are not a list are refused")
+    raises(lambda: point_xy({"type": "Point", "coordinates": None}, 3),
+           "null point coordinates are refused, not read as an empty point")
+    raises(lambda: point_xy({"type": "Point"}, 3),
+           "a point with no coordinates member is refused as well")
+    raises(lambda: point_xy({"type": "Point", "coordinates": ["-82.1", 29.2]},
+                            3), "a text coordinate in the geometry is refused")
+    raises(lambda: point_xy({"type": "Point",
+                             "coordinates": [612345.25, 1740000.5]}, 3),
+           "state plane feet in the geometry are refused, not read as "
+           "degrees  <-- pinned defect")
+    raises(lambda: point_xy({"type": "Point", "coordinates": [0.0, 90.5]}, 3),
+           "a latitude past the pole is refused")
+    raises(lambda: point_xy({"type": "Point", "coordinates": [180.5, 0.0]}, 3),
+           "a longitude past 180, the 0-360 convention, is refused  "
+           "<-- pinned defect")
+    raises(lambda: point_xy({"type": "Point",
+                             "coordinates": [float("nan"), float("nan")]}, 3),
+           "a NaN geometry is refused, not planned as no geometry  "
+           "<-- pinned defect")
+    raises(lambda: point_xy({"type": "Point",
+                             "coordinates": [-82.1, float("nan")]}, 3),
+           "a NaN latitude alone is refused as well  <-- pinned defect")
+    def refusal(fn):
+        """The ValueError message fn raises, or "" when it raises none."""
+        try:
+            fn()
+        except ValueError as exc:
+            return str(exc)
+        return ""
+    check(refusal(lambda: None) == "",
+          "a call that refuses nothing gives no reason, so a check on the "
+          "reason cannot pass by accident")
+    nad27 = {"type": "name", "properties": {
+        "name": "urn:ogc:def:crs:EPSG::4267"}}
+    crs84 = {"type": "name", "properties": {
+        "name": "urn:ogc:def:crs:OGC:1.3:CRS84"}}
+
+    def nested_crs(where, crs):
+        """One clean point with a crs member on the feature or the geometry."""
+        doc = _stub_geojson(_stub_rows()[:1])
+        target = doc["features"][0]
+        if where == "geometry":
+            target = target["geometry"]
+        target["crs"] = crs
+        return doc
+
+    for where in ("feature", "geometry"):
+        reason = refusal(lambda: feature_rows(nested_crs(where, nad27),
+                                              "X", "Y"))
+        check("4267" in reason
+              and ("geometry of feature 1" in reason) == (where == "geometry"),
+              "a NAD27 crs on the %s is refused, not compared with WGS84 "
+              "columns as clean  <-- pinned defect" % where)
+        check(len(feature_rows(nested_crs(where, crs84), "X", "Y")) == 1,
+              "a CRS84 crs on the %s is lon/lat and is read" % where)
+    refused = refusal(lambda: point_xy({"type": "MultiPoint",
+                                        "coordinates": []}, 9))
+    check("feature 9" in refused and "MultiPoint" in refused,
+          "a refused geometry names the feature and its type")
+
+    doc = _stub_geojson()
+    rows = feature_rows(doc, "X", "Y")
+    check(len(rows) == 7, "every feature becomes one row")
+    check(rows[3] == (4, -82.4, 29.5, -82.3999, 29.5),
+          "a row carries the id, the stored pair and the geometry pair")
+    check(rows[5][3:] == (None, None),
+          "a feature with null geometry reads as no geometry")
+    single_feature = {"type": "Feature", "geometry": {
+        "type": "Point", "coordinates": [1.0, 2.0]},
+        "properties": {"X": 1.0, "Y": 2.0}}
+    check(feature_rows(single_feature, "X", "Y") == [(1, 1.0, 2.0, 1.0, 2.0)],
+          "a bare Feature is read as one row numbered 1")
+    sparse = {"type": "FeatureCollection", "features": [
+        {"type": "Feature", "id": "a",
+         "geometry": {"type": "Point", "coordinates": [1.0, 2.0]},
+         "properties": {"X": 1.0, "Y": 2.0}},
+        {"type": "Feature", "id": "b",
+         "geometry": {"type": "Point", "coordinates": [1.0, 2.0]},
+         "properties": {"Y": 2.0}},
+        {"type": "Feature", "id": "c",
+         "geometry": {"type": "Point", "coordinates": [1.0, 2.0]},
+         "properties": None}]}
+    sparse_rows = feature_rows(sparse, "X", "Y")
+    check([r[0] for r in sparse_rows] == ["a", "b", "c"],
+          "the OID of a file row is the feature's id member")
+    idless = _stub_geojson()
+    del idless["features"][2]["id"]
+    check(feature_rows(idless, "X", "Y")[2][0] == 3,
+          "a feature with no id takes its 1-based position")
+    zero_id = _stub_geojson()
+    zero_id["features"][2]["id"] = 0
+    check(feature_rows(zero_id, "X", "Y")[2][0] == 0,
+          "a feature whose id is 0 keeps it, not its position")
+    check(sparse_rows[1][1] is None and sparse_rows[2][1:3] == (None, None),
+          "an absent property and null properties read as empty columns")
+    check([p.verdict for p in plan_rows(sparse_rows, tol, True)]
+          == [OK, FILL, FILL],
+          "and so they plan as FILL, the same as a null in a layer")
+    empty = refusal(lambda: feature_rows(
+        {"type": "FeatureCollection", "features": []}, "TYPO", "Y"))
+    check("no features" in empty and "TYPO" in empty,
+          "an empty collection is refused, because a misspelled column "
+          "cannot be caught in it  <-- pinned defect")
+
+    def mutated(field, value):
+        bad = _stub_geojson()
+        bad["features"][2]["properties"][field] = value
+        return bad
+    refused = refusal(lambda: feature_rows(mutated("X", "-82.3"), "X", "Y"))
+    check("column X" in refused and "feature 3" in refused,
+          "a coordinate stored as text is refused, not compared, and the "
+          "refusal names the column and the feature  <-- pinned defect")
+    raises(lambda: feature_rows(mutated("Y", True), "X", "Y"),
+           "a coordinate stored as true is refused")
+    raises(lambda: feature_rows(mutated("Y", float("inf")), "X", "Y"),
+           "an infinite coordinate is refused")
+    raises(lambda: feature_rows(doc, "LON", "Y"),
+           "a column no feature carries is refused as a misspelling")
+    raises(lambda: feature_rows({"type": "Point", "coordinates": [1, 2]},
+                                "X", "Y"),
+           "a bare geometry is not a feature collection")
+    raises(lambda: feature_rows([], "X", "Y"),
+           "a document that is a list is refused")
+    raises(lambda: feature_rows({"type": "FeatureCollection"}, "X", "Y"),
+           "a collection with no features list is refused")
+    raises(lambda: feature_rows({"type": "FeatureCollection", "features": 5},
+                                "X", "Y"),
+           "a features member that is a number is refused, not a traceback "
+           "that exits 1  <-- pinned defect")
+    not_feature = refusal(lambda: feature_rows({
+        "type": "FeatureCollection", "features": [{
+            "type": "feature", "geometry": None,
+            "properties": {"X": 1.0, "Y": 2.0}}]}, "X", "Y"))
+    check("is not a Feature" in not_feature,
+          "an item typed feature in lower case is refused as not a Feature, "
+          "even when it carries both columns")
+    raises(lambda: feature_rows({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "geometry": None, "properties": [1, 2]}]},
+        "X", "Y"), "properties that are not an object are refused")
+    not_object = refusal(lambda: feature_rows({
+        "type": "FeatureCollection", "features": [{
+            "type": "Feature", "id": "a\nb", "geometry": None,
+            "properties": []}]}, "X", "Y"))
+    check("feature a\\x0ab has properties that are not an object" in not_object,
+          "empty properties that are a list are refused, not read as an empty "
+          "object, and the refusal escapes the id")
+
+    check(lonlat_refusal(rows, "X", "Y") is None,
+          "lon/lat columns pass the range check")
+    feet = [(1, 612345.25, 1740000.5, -82.1, 29.2),
+            (2, None, None, -82.2, 29.3)]
+    feet_reason = lonlat_refusal(feet, "X", "Y")
+    check(feet_reason is not None and "column X" in feet_reason,
+          "columns in feet under --xy-crs 4326 are refused, because the "
+          "caller's word was wrong  <-- pinned defect")
+    check(lonlat_refusal([(1, -82.1, 1740000.5, -82.1, 29.2)], "X", "Y")
+          is not None, "a Y column with no latitude in it is refused")
+    check(lonlat_refusal([(1, -82.1, 120.0, -82.1, 29.2)], "X", "Y")
+          is not None, "a Y column whose values are all past 90 is refused")
+    check(lonlat_refusal([(1, 180.0, 90.0, 180.0, 0.0)], "X", "Y") is None,
+          "exactly 180 and exactly 90 are still degrees")
+    wild = [(1, -82.1, 29.2, -82.1, 29.2), (2, -8210.0, 29.3, -82.2, 29.3)]
+    check(lonlat_refusal(wild, "X", "Y") is None,
+          "one wild value among real longitudes is a drifted row, not a "
+          "refusal")
+    check(lonlat_refusal([(1, None, None, None, None)], "X", "Y") is None,
+          "columns that are all empty have no system to disagree with")
+    raises(lambda: geojson_rows({"type": "FeatureCollection", "crs": {
+        "type": "name", "properties": {"name": "EPSG:2237"}},
+        "features": []}, "X", "Y"),
+        "the whole-file checks raise the crs refusal")
+    raises(lambda: geojson_rows({"type": "FeatureCollection", "features": [
+        {"type": "Feature", "geometry": None,
+         "properties": {"X": 612345.25, "Y": 29.0}}]}, "X", "Y"),
+        "and the range refusal")
+    check(len(geojson_rows(doc, "X", "Y")) == 7,
+          "a clean file passes all of them and gives its rows")
+
+    # The claim the mode rests on: the same rows give the same plans whether
+    # they come from the layer or from the file.
+    stub = _StubArcpy(_stub_rows())
+    from_layer = scan(stub, _StubArcpy.FC, "X", "Y",
+                      stub.SpatialReference(4326), tol, True)
+    from_file = plan_rows(rows, tol, True)
+    same = [(a.oid, a.verdict, a.dx, a.dy, a.new_x, a.new_y)
+            for a in from_layer] == [
+        (b.oid, b.verdict, b.dx, b.dy, b.new_x, b.new_y) for b in from_file]
+    check(same, "a file and a layer holding the same rows plan identically, "
+          "down to the measured drift")
+    noisy_file = feature_rows({"type": "Feature", "id": 1, "geometry": {
+        "type": "Point", "coordinates": [-82.100000004, 29.200000004]},
+        "properties": {"X": -82.1, "Y": 29.2}}, "X", "Y")
+    check(plan_rows(noisy_file, 1e-9, True)[0].verdict == OK,
+          "the file path rounds the geometry exactly as the scan does")
+
+    # The antimeridian, read from a file.
+    def one_point(stored_x, geom_x):
+        return feature_rows({"type": "Feature", "id": 1, "geometry": {
+            "type": "Point", "coordinates": [geom_x, 10.0]},
+            "properties": {"X": stored_x, "Y": 10.0}}, "X", "Y")
+    check(plan_rows(one_point(-180.0, 180.0), tol, True)[0].verdict == OK,
+          "a stored -180 against a point at +180 is not drift in a file "
+          "either  <-- pinned defect")
+    check(plan_rows(one_point(179.9999999, -179.9999999), tol, True)[0]
+          .verdict == OK, "two sides of the antimeridian 2e-7 apart are clean")
+    across = plan_rows(one_point(179.99, -179.99), tol, True)[0]
+    check(across.verdict == DRIFT and abs(across.dx - 0.02) < 1e-9,
+          "a real move across the antimeridian measures 0.02 degrees, not "
+          "359.98")
+
+    # ---- the GeoJSON mode end to end, on real files. Everything below
+    # writes into one temp directory and deletes it again.
+    tmp = tempfile.mkdtemp(prefix="xydrift-selftest-")
+
+    def tmpfile(name, content):
+        path = os.path.join(tmp, name)
+        if not isinstance(content, bytes):
+            content = content.encode("utf-8")
+        with open(path, "wb") as handle:
+            handle.write(content)
+        return path
+
+    def read_bytes(path):
+        with open(path, "rb") as handle:
+            return handle.read()
+
+    def run_cli(argv):
+        """main() with stdout and stderr captured together."""
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with contextlib.redirect_stderr(out):
+                code = main(argv)
+        return code, out.getvalue()
+
+    def run_file(name, text, *extra):
+        path = tmpfile(name, text)
+        return run_cli(["--from-geojson", path, "--xy-crs", "4326"]
+                       + list(extra))
+
+    try:
+        drift_path = tmpfile("drift.geojson", json.dumps(_stub_geojson()))
+        before = read_bytes(drift_path)
+        base = ["--from-geojson", drift_path, "--xy-crs", "4326"]
+        with mock.patch.dict(sys.modules, {"arcpy": None}):
+            code, out = run_cli(base)
+        check(code == 1, "a file with drift exits 1, with arcpy made "
+              "unimportable, so the mode never reaches for it")
+        check("rows read: 7" in out and "OID 4 DRIFT" in out
+              and "OID 7 DRIFT" in out and "OID 5 FILL" in out,
+              "the file report names the same rows as the layer report")
+        check("tolerance: 1e-06 degrees" in out,
+              "a file defaults to the same 1e-6 degree tolerance")
+        check("1 row(s) have no geometry" in out,
+              "a feature with null geometry is left alone and counted")
+        check(("source: %s, file modified " % printable(drift_path)) in out
+              and "export time only if every copy kept it" in out
+              and "not the live layer" in out,
+              "the report names the file and its modified time, and says a "
+              "copy resets that time  <-- pinned defect")
+        check("A GeoJSON file is never written" in out
+              and "resync 3 row(s)" in out,
+              "the check says how many rows a resync would touch, and where "
+              "a resync has to run")
+        check(read_bytes(drift_path) == before
+              and os.listdir(tmp) == ["drift.geojson"],
+              "the run changed no byte of the file and wrote no other file")
+
+        code, out = run_cli(base + ["--apply"])
+        check(code == 64 and "--apply does not apply" in out,
+              "--apply on a file is refused, because a file is never "
+              "written  <-- pinned defect")
+        check(read_bytes(drift_path) == before,
+              "and the refused apply left the file as it was")
+        code, out = run_cli(base + ["--workspace", "stub.gdb"])
+        check(code == 64 and "--workspace does not apply" in out,
+              "--workspace on a file is refused")
+        code, out = run_cli(base + ["--wkid", "2237"])
+        check(code == 64 and "--wkid does not apply" in out
+              and "--xy-crs" in out,
+              "--wkid on a file is refused and points at --xy-crs")
+        code, out = run_cli(["--from-geojson", drift_path])
+        check(code == 64 and "needs --xy-crs" in out,
+              "a file run without --xy-crs is refused")
+        absent = os.path.join(tmp, "absent.geojson")
+        code, out = run_cli(["--from-geojson", absent, "--xy-crs", "2237"])
+        check(code == 64 and "--xy-crs 2237" in out and "absent" not in out,
+              "--xy-crs 2237 is refused before the file is even "
+              "opened  <-- pinned defect")
+        code, out = run_cli(base + ["--tolerance", "1e-9"])
+        check(code == 64 and "rounding itself" in out,
+              "a file tolerance under the grid is refused the same way")
+        code, out = run_cli(base + ["--tolerance", "1", "--tolerance-units",
+                                    "meters"])
+        check(code == 1 and "tolerance: 8.98" in out,
+              "a metre tolerance on a file is converted to degrees")
+        code, out = run_cli(base + ["--tolerance", "100", "--tolerance-units",
+                                    "meters"])
+        check("  DRIFT             0" in out and "resync 1 row(s)" in out,
+              "a 100 m tolerance hides the 11 m move in a file as well, and "
+              "the empty row is still reported")
+        code, out = run_cli(base + ["--tolerance", "0.001"])
+        check(code == 1 and "tolerance: 0.001 degrees" in out,
+              "a bare tolerance on a file is degrees")
+        code, out = run_cli(base + ["--limit", "1"])
+        check("... and 2 more" in out, "--limit reaches the file report")
+        code, out = run_cli(base + ["--x-field", "LON"])
+        check(code == 64 and "not in the properties" in out,
+              "a misspelled column on a file is refused")
+        code, out = run_cli(base + ["--x-field", "LABEL"])
+        check(code == 64 and "finite number" in out,
+              "a text column on a file is refused")
+
+        code, out = run_file("clean.geojson",
+                             json.dumps(_stub_geojson(_stub_rows()[:3])))
+        check(code == 0 and "Every stored coordinate agrees" in out,
+              "a clean file exits 0 and says so")
+        code, out = run_file("antimeridian.geojson", json.dumps({
+            "type": "FeatureCollection", "features": [
+                {"type": "Feature", "id": 1, "geometry": {
+                    "type": "Point", "coordinates": [180.0, -16.5]},
+                 "properties": {"X": -180.0, "Y": -16.5}},
+                {"type": "Feature", "id": 2, "geometry": {
+                    "type": "Point", "coordinates": [-179.9999999, -16.6]},
+                 "properties": {"X": 179.9999999, "Y": -16.6}}]}))
+        check(code == 0 and "Every stored coordinate agrees" in out,
+              "a file of points on the antimeridian runs clean end to end, so "
+              "the file mode wraps longitude  <-- pinned defect")
+        code, out = run_file("empty.geojson",
+                             '{"type": "FeatureCollection", "features": []}')
+        check(code == 64 and "no features" in out and "agrees" not in out,
+              "an empty collection exits 64 and claims nothing agrees  "
+              "<-- pinned defect")
+        code, out = run_file("bom.geojson", b"\xef\xbb\xbf"
+                             + json.dumps(_stub_geojson()).encode("utf-8"))
+        check(code == 1 and "rows read: 7" in out,
+              "a file saved with a byte order mark still reads")
+        code, out = run_cli(["--from-geojson", absent, "--xy-crs", "4326"])
+        check(code == 64 and "absent.geojson" in out,
+              "a file that does not exist is refused by name")
+        code, out = run_file("bad.geojson", "{")
+        check(code == 64 and "error:" in out,
+              "a file that is not JSON is refused")
+        code, out = run_file("latin.geojson", b'{"a": "\xe9"}')
+        check(code == 64 and "error:" in out,
+              "a file that is not UTF-8 is refused")
+        text = json.dumps(_stub_geojson())
+        code, out = run_file("nan.geojson", text.replace("-82.4, ", "NaN, ", 1))
+        check(code == 64 and "NaN" in out,
+              "a NaN in the file is refused, not planned as "
+              "clean  <-- pinned defect")
+        code, out = run_file("inf.geojson",
+                             text.replace("-82.4, ", "1e400, ", 1))
+        check(code == 64 and "finite number" in out,
+              "a number too large for a float is refused as well")
+        code, out = run_file("infword.geojson",
+                             text.replace("-82.4, ", "-Infinity, ", 1))
+        check(code == 64 and "Infinity" in out, "so is Infinity")
+        code, out = run_file("nanlabel.geojson",
+                             text.replace('"p1"', "NaN", 1))
+        check(code == 1 and "rows read: 7" in out,
+              "a NaN in a column that is not compared does not stop the run")
+        crs_doc = _stub_geojson()
+        crs_doc["crs"] = {"type": "name",
+                          "properties": {"name": "urn:ogc:def:crs:EPSG::2237"}}
+        code, out = run_file("crs.geojson", json.dumps(crs_doc))
+        check(code == 64 and "cannot reproject" in out,
+              "a file that declares projected geometry is refused end to end")
+        feet_doc = _stub_geojson()
+        for feature in feet_doc["features"]:
+            props = feature["properties"]
+            props["X"] = None if props["X"] is None else props["X"] * -7000.0
+            props["Y"] = None if props["Y"] is None else props["Y"] * 60000.0
+        code, out = run_file("feet.geojson", json.dumps(feet_doc))
+        check(code == 64 and "whatever --xy-crs says" in out,
+              "columns in feet are refused even when --xy-crs claims 4326")
+
+        refused_tolerances = []
+        for bad in ("nan", "inf", "1e400"):
+            code, out = run_cli(base + ["--tolerance", bad])
+            refused_tolerances.append(code == 64 and "not a distance" in out)
+        check(refused_tolerances == [True, True, True],
+              "--tolerance nan, inf and 1e400 on a file are refused, not run "
+              "as a clean file  <-- pinned defect")
+        whole_turn = _stub_geojson(_stub_rows()[:3])
+        whole_turn["features"][1]["properties"]["X"] = -82.2 - 7200.0
+        whole_turn["features"][2]["properties"]["X"] = -82.3 + 360.0
+        code, out = run_file("turn.geojson", json.dumps(whole_turn))
+        check(code == 1 and "OID 2 DRIFT" in out and "OID 3 DRIFT" in out,
+              "a stored X twenty turns off, or in the 0-360 convention, is "
+              "drift in a file, not a match  <-- pinned defect")
+        code, out = run_file("dup.geojson", (
+            '{"type": "FeatureCollection", "features": [{"type": "Feature", '
+            '"id": 1, "geometry": {"type": "Point", "coordinates": '
+            '[-82.3999, 29.5]}, "properties": {"X": -82.4, "Y": 29.5, '
+            '"X": -82.3999}}]}'))
+        check(code == 64 and 'the name "X" appears twice' in out,
+              "a file with one column named twice in a feature is refused, "
+              "not read as whichever value won  <-- pinned defect")
+        code, out = run_file("deep.geojson", "[" * 200000 + "]" * 200000)
+        check(code == 64 and "error:" in out and "recursion" in out,
+              "a file nested too deep to parse exits 64 with a message, not "
+              "a traceback that exits 1  <-- pinned defect")
+        with mock.patch("json.loads", side_effect=MemoryError):
+            code, out = run_file("huge.geojson", json.dumps(_stub_geojson()))
+        check(code == 64 and "error:" in out,
+              "a file too large for memory exits 64, not a traceback that "
+              "exits 1  <-- pinned defect")
+        shapeless_doc = _stub_geojson(_stub_rows()[5:6] * 3)
+        code, out = run_file("nogeom.geojson", json.dumps(shapeless_doc))
+        check(code == 64 and "no feature has a geometry" in out
+              and "Every stored" not in out,
+              "a file with no geometry on any feature exits 64, not a clean "
+              "0  <-- pinned defect")
+        mostly = _stub_geojson(_stub_rows()[:1] + _stub_rows()[5:6] * 3)
+        code, out = run_file("mostnull.geojson", json.dumps(mostly))
+        check(code == 0 and "3 row(s) have no geometry" in out
+              and "that has a geometry agrees" in out,
+              "a file with one clean point and three without geometry exits "
+              "0 and says three rows were not compared")
+        forge = _stub_geojson(_stub_rows()[3:4])
+        forge["features"][0]["id"] = ("4 OK\n\nEvery stored coordinate "
+                                      "agrees with its geometry.\n\x1b[8m")
+        code, out = run_file("forge.geojson", json.dumps(forge))
+        check(code == 1 and "\x1b" not in out
+              and "\nEvery stored coordinate agrees" not in out
+              and "\\x0a\\x0aEvery stored" in out,
+              "an id holding newlines and ESC[8m prints escaped, so it forges "
+              "no clean line and hides no drift line  <-- pinned defect")
+        forge = _stub_geojson(_stub_rows()[3:4])
+        forge["features"][0]["id"] = "a\rb"
+        forge["features"][0]["geometry"]["type"] = "Line\x1b[2K\rString"
+        code, out = run_file("forgetype.geojson", json.dumps(forge))
+        check(code == 64 and "feature a\\x0db has a Line\\x1b[2K\\x0dString"
+              in out and "\r" not in out and "\x1b" not in out,
+              "a refusal escapes the id and the geometry type it quotes from "
+              "the file  <-- pinned defect")
+        forge = _stub_geojson(_stub_rows()[3:4])
+        forge["features"][0]["id"] = "a\nb"
+        forge["features"][0]["properties"]["X"] = "-82.4"
+        code, out = run_file("forgeprop.geojson", json.dumps(forge))
+        check(code == 64 and "feature a\\x0ab" in out,
+              "a refused column names its feature escaped as well")
+
+        old_path = tmpfile("old.geojson", json.dumps(_stub_geojson()))
+        os.utime(old_path, (0, -100000.0))
+        code, out = run_cli(["--from-geojson", old_path, "--xy-crs", "4326"])
+        check(code == 1 and "OID 4 DRIFT" in out,
+              "a file modified before 1970 is still checked  <-- pinned defect")
+        for exc in (OSError(22, "Invalid argument"),
+                    OverflowError("timestamp out of range for platform time_t"),
+                    ValueError("year is out of range")):
+            with mock.patch("time.gmtime", side_effect=exc):
+                code, out = run_cli(base)
+            check(code == 1 and "file modified unknown" in out,
+                  "a modified time the platform cannot convert (%s) prints as "
+                  "unknown, and the check still runs"
+                  % type(exc).__name__.lower())
+
+        uni = _stub_geojson()
+        uni["features"][3]["id"] = u"\u6771\u4eac"
+        uni["features"][6]["id"] = u"\ud800"
+        code, out = run_file(u"\u6771.geojson", json.dumps(uni))
+        check(code == 1 and "OID \\u6771\\u4eac DRIFT" in out
+              and "OID \\ud800 DRIFT" in out and "\\u6771.geojson" in out
+              and is_ascii(out),
+              "a CJK id, a lone surrogate id and a CJK file name print as "
+              "ASCII escapes, so no console encoding can stop the "
+              "report  <-- pinned defect")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    check(not os.path.exists(tmp), "the self-test removed its temp directory")
+
+    # ---- which flags go together
+    code, out = run_cli(["--layer", _StubArcpy.FC, "--from-geojson",
+                         "x.geojson", "--xy-crs", "4326"])
+    check(code == 64 and "not both" in out,
+          "a layer and a file together are refused")
+    same_stub = _StubArcpy(_stub_rows())
+    code, out = run_stub(same_stub, y_field="X", apply=True)
+    check(code == 64 and "both name X" in out and same_stub.updates == 0
+          and same_stub.opened == [],
+          "one column named as both X and Y is refused before --apply can "
+          "write the latitude into it  <-- pinned defect")
+    code, out = run_cli(["--from-geojson", "x.geojson", "--xy-crs", "4326",
+                         "--x-field", "Y"])
+    check(code == 64 and "both name Y" in out,
+          "a file run refuses the same")
+    code, out = run_cli(["--layer", _StubArcpy.FC, "--xy-crs", "4326"])
+    check(code == 64 and "applies only to --from-geojson" in out
+          and "--wkid" in out,
+          "--xy-crs on a layer is refused and points at --wkid")
+
+    # ---- arcpy itself, absent and present
+    with mock.patch.dict(sys.modules, {"arcpy": None}):
+        code, out = run_cli(["--layer", _StubArcpy.FC])
+    check(code == 3 and "arcpy was not found" in out,
+          "a layer run without arcpy exits 3, not the 1 that means drift "
+          "found  <-- pinned defect")
+    check(PRO_PYTHON in out and "--from-geojson" in out,
+          "and names the Pro interpreter and the mode that needs none")
+    class _Unlicensed(object):
+        """A finder whose arcpy fails to start, as an unlicensed one does.
+
+        It fails every import, and arcpy is the only one the run makes."""
+        def find_spec(self, name, path=None, target=None):
+            raise RuntimeError("NotInitialized")
+    with mock.patch.dict(sys.modules):
+        sys.modules.pop("arcpy", None)
+        sys.meta_path.insert(0, _Unlicensed())
+        try:
+            code, out = run_cli(["--layer", _StubArcpy.FC])
+        finally:
+            sys.meta_path.pop(0)
+    check(code == 3 and "NotInitialized" in out and "licence" in out,
+          "an arcpy that fails to start without a licence exits 3, not a "
+          "traceback that exits 1  <-- pinned defect")
+    with mock.patch.dict(sys.modules, {"arcpy": _StubArcpy([])}):
+        code, out = run_cli(["--layer", _StubArcpy.FC])
+        typo, typo_out = run_cli(["--layer", _StubArcpy.FC, "--x-field", "TYPO"])
+    check(code == 0 and typo == 64 and "column TYPO is not in" in typo_out,
+          "an empty layer exits 0, because its field list still catches a "
+          "misspelled column")
+    with mock.patch.dict(sys.modules, {"arcpy": _StubArcpy(_stub_rows())}):
+        code, out = run_cli(["--layer", _StubArcpy.FC])
+    check(code == 1 and "resync 3 row(s)" in out,
+          "the real entry point imports arcpy and runs the layer check")
 
     # ---- argument handling
     a = _parse(["--layer", "L"])
@@ -1252,27 +2505,105 @@ def self_test():
     check("--layer is required" in err.getvalue(),
           "and the usage error says which flag is missing")
 
+    check(_parse(["--from-geojson", "f", "--xy-crs", "4326"]).xy_crs == 4326,
+          "--xy-crs is read as a number")
+    usage = []
+    for argv in (["--from-geojson", "f", "--xy-crs", "EPSG:4326"],
+                 ["--layer", "L", "--tolerance", "abc"],
+                 ["--layer", "L", "--furlongs"]):
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                main(argv)
+        except SystemExit as exc:
+            usage.append((exc.code, "error:" in err.getvalue()))
+    check(usage == [(64, True)] * 3,
+          "a value or a flag argparse rejects exits 64, not the 2 that means "
+          "the resync failed part way  <-- pinned defect")
+    check(a.from_geojson is None and a.xy_crs is None,
+          "--from-geojson and --xy-crs default to none")
+
+    # ---- the stub's own guards, so a wrong test fails loudly
+    stub = _StubArcpy(_stub_rows())
+    raises(lambda: scan(stub, _StubArcpy.FC, "X", "Y",
+                        stub.SpatialReference(3857), 1.0, False),
+           "the stub refuses a system it holds no geometry for, rather than "
+           "reading zeros", RuntimeError)
+    with stub.da.SearchCursor(_StubArcpy.FC, ["OID@", "X", "Y"]) as cursor:
+        raises(lambda: cursor.updateRow([1, 0.0, 0.0]),
+               "the stub's search cursor refuses a write", RuntimeError)
+
+    # ---- importing the module, which is how a snippet calls the cores.
+    # Compiled and run by hand: an import through importlib would cache
+    # bytecode in a __pycache__ beside the script, which is a write.
+    here = os.path.dirname(os.path.abspath(__file__))
+    beside = sorted(os.listdir(here))
+    probe = ModuleType("xydrift_probe")
+    probe.__file__ = __file__
+    with open(__file__, "rb") as handle:
+        code_obj = compile(handle.read(), __file__, "exec")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        exec(code_obj, probe.__dict__)
+    check(out.getvalue() == "" and callable(probe.plan_rows)
+          and callable(probe.geojson_rows),
+          "importing the module runs nothing and exposes the cores")
+    check(sorted(os.listdir(here)) == beside,
+          "and writes nothing beside the script, not even a "
+          "__pycache__  <-- pinned defect")
+
+    # ---- the harness itself, which must be able to fail
+    p_check, p_raises, p_passed, p_failed = _harness()
+    with contextlib.redirect_stdout(io.StringIO()):
+        p_check(True, "t")
+        p_check(False, "f")
+        p_raises(lambda: None, "n")
+        p_raises(lambda: 1 / 0, "z")
+        p_raises(lambda: int("x"), "v")
+    check(p_passed[0] == 2 and p_failed[:2] == ["f", "n (no error raised)"],
+          "a false check and a raises() that raised nothing both count as "
+          "failures")
+    check(len(p_failed) == 3
+          and p_failed[2].startswith("z (wrong exception ZeroDivisionError"),
+          "an exception of the wrong type is a failure, not a pass")
+    check(_footer(2, ["f"]) == (["3 assertions, 1 failed", "  FAILED: f"], 1),
+          "a run with a failure prints it and exits 1")
+    check(_footer(3, []) == (["3 assertions, 0 failed"], 0),
+          "a green run prints the count and exits 0")
+
     print("-" * 68)
-    total = passed[0] + len(failed)
-    if failed:
-        print("%d assertions, %d failed" % (total, len(failed)))
-        for f in failed:
-            print("  FAILED: %s" % f)
-        return 1
-    print("%d assertions, 0 failed" % total)
-    return 0
+    lines, code = _footer(passed[0], failed)
+    for line in lines:
+        print(line)
+    return code
 
 
 # ----------------------------------------------------------------------- cli
 
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse exits 2 on a usage error, and 2 here means the resync
+        # failed part way. A typo must not look like a half-written layer.
+        self.print_usage(sys.stderr)
+        self.exit(64, "%s: error: %s\n" % (self.prog, message))
+
+
 def _parse(argv):
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog="xydrift.py",
         description="Name the rows whose stored X and Y columns disagree with "
                     "their own geometry, and resync only those.",
         epilog="Nothing is written without --apply.",
     )
-    ap.add_argument("--layer", help="point feature class to check")
+    ap.add_argument("--layer", help="point feature class to check. Needs arcpy.")
+    ap.add_argument("--from-geojson", dest="from_geojson", metavar="FILE",
+                    help="check a GeoJSON file of points instead of a layer. "
+                         "Read-only, needs no arcpy, and needs --xy-crs.")
+    ap.add_argument("--xy-crs", dest="xy_crs", type=int, metavar="EPSG",
+                    help="EPSG code the stored columns in a GeoJSON file are "
+                         "in. Only %d is accepted, because GeoJSON geometry "
+                         "is always lon/lat and nothing here reprojects."
+                         % GEOJSON_WKID)
     ap.add_argument("--x-field", dest="x_field", default="X",
                     help="stored longitude or easting column (default X)")
     ap.add_argument("--y-field", dest="y_field", default="Y",
@@ -1309,15 +2640,29 @@ def main(argv=None):
     if args.self_test:
         return self_test()
 
-    if not args.layer:
-        print("error: --layer is required. Use --self-test to verify the tool "
-              "without a geodatabase.", file=sys.stderr)
+    if args.layer and args.from_geojson:
+        print("error: give --layer or --from-geojson, not both.",
+              file=sys.stderr)
+        return 64
+    if not (args.layer or args.from_geojson):
+        print("error: --layer is required, or --from-geojson with --xy-crs "
+              "for a file. Use --self-test to verify the tool without a "
+              "geodatabase.", file=sys.stderr)
         return 64
     if args.limit < 0:
         print("error: --limit cannot be negative.", file=sys.stderr)
         return 64
 
-    return run(args, _import_arcpy())
+    if args.from_geojson:
+        return run_geojson(args)
+    if args.xy_crs is not None:
+        print("error: --xy-crs applies only to --from-geojson. A layer's "
+              "columns are read in --wkid.", file=sys.stderr)
+        return 64
+    arcpy = _import_arcpy()
+    if arcpy is None:
+        return 3
+    return run(args, arcpy)
 
 
 if __name__ == "__main__":
