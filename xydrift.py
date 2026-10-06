@@ -807,7 +807,25 @@ def layer_profile(arcpy, layer, wkid):
     return sr, geographic, meters_per_unit, types
 
 
-def scan(arcpy, layer, x_field, y_field, sr, tolerance, wrap):
+def datum_transformation(arcpy, layer, sr):
+    """The transformation Pro's own tools pick into sr, or None if none applies.
+
+    A NAD83 state plane layer compared in WGS84 lon/lat crosses a datum.
+    Calculate Geometry Attributes applies the first listed transformation
+    when it fills the columns, but a SearchCursor applies none unless told.
+    Without it every unmoved row of such a layer read as DRIFT by about
+    0.5 m, and --apply would rewrite the whole layer.
+    """
+    desc = arcpy.Describe(layer)
+    source = desc.spatialReference
+    if source.GCS.name == sr.GCS.name:
+        return None
+    names = arcpy.ListTransformations(source, sr, desc.extent)
+    return names[0] if names else None
+
+
+def scan(arcpy, layer, x_field, y_field, sr, tolerance, wrap,
+         transformation=None):
     """Read every row once and plan it. Opens no update cursor.
 
     ponytail: every plan is held in memory and there is no where clause, so a
@@ -815,7 +833,8 @@ def scan(arcpy, layer, x_field, y_field, sr, tolerance, wrap):
     OID range if a layer outgrows it.
     """
     fields = ["OID@", x_field, y_field, "SHAPE@X", "SHAPE@Y"]
-    with arcpy.da.SearchCursor(layer, fields, spatial_reference=sr) as cursor:
+    with arcpy.da.SearchCursor(layer, fields, spatial_reference=sr,
+                               datum_transformation=transformation) as cursor:
         # The geometry token returns the full float64 projection of the
         # point. plan_rows rounds it to the grid before any comparison.
         return plan_rows(cursor, tolerance, wrap)
@@ -944,8 +963,12 @@ def check_layer(args, arcpy):
             return 64, None
 
     units_label = "degrees" if geographic else "linear units"
+    transformation = datum_transformation(arcpy, args.layer, sr)
+    if transformation is not None:
+        print("datum transformation: %s (the default Pro's tools pick)"
+              % transformation)
     plans = scan(arcpy, args.layer, args.x_field, args.y_field, sr,
-                 tolerance, geographic)
+                 tolerance, geographic, transformation)
     for line in describe(plans, tolerance, units_label, args.limit):
         print(line)
     if nothing_compared(plans):
@@ -986,10 +1009,11 @@ class _StubExtent(object):
 
 
 class _StubDescribe(object):
-    """arcpy.Describe's result in the one attribute this tool reads."""
+    """arcpy.Describe's result in the two attributes this tool reads."""
 
-    def __init__(self, extent):
+    def __init__(self, extent, wkid):
         self.extent = extent
+        self.spatialReference = _StubSpatialReference(wkid)
 
 
 class _StubSpatialReference(object):
@@ -999,15 +1023,24 @@ class _StubSpatialReference(object):
         self.factoryCode = wkid
         self.type = "Geographic" if wkid == 4326 else "Projected"
         self.metersPerUnit = None if wkid == 4326 else 0.3048006096012192
+        self.GCS = _StubField("GCS_North_American_1983" if wkid == 2237
+                              else "GCS_WGS_1984", "GCS")
 
 
 class _StubCursor(object):
     """arcpy.da.SearchCursor and UpdateCursor, in the surface used here."""
 
-    def __init__(self, table, fields, sr, writable):
+    def __init__(self, table, fields, sr, writable, transformation=None):
         self._table = table
         self._fields = list(fields)
         self._sr = sr
+        # A read across a datum with no transformation lands about 0.5 m off,
+        # as the real cursor does for NAD83 geometry read in WGS84.
+        self._shift = 0.0
+        if sr is not None and transformation is None and (
+                _StubSpatialReference(table.layer_wkid).GCS.name
+                != sr.GCS.name):
+            self._shift = 5e-6
         self._writable = writable
         self._oid = None
         table.opened.append((list(fields), None if sr is None else sr.factoryCode,
@@ -1029,7 +1062,7 @@ class _StubCursor(object):
             code = self._sr.factoryCode
             if code not in geom:
                 raise RuntimeError("the stub holds no geometry in %s" % code)
-            return geom[code][0 if field == "SHAPE@X" else 1]
+            return geom[code][0 if field == "SHAPE@X" else 1] + self._shift
         return row[field]
 
     def __iter__(self):
@@ -1080,8 +1113,10 @@ class _StubDa(object):
     def __init__(self, table):
         self._table = table
 
-    def SearchCursor(self, layer, fields, spatial_reference=None):
-        return _StubCursor(self._table, fields, spatial_reference, False)
+    def SearchCursor(self, layer, fields, spatial_reference=None,
+                     datum_transformation=None):
+        return _StubCursor(self._table, fields, spatial_reference, False,
+                           datum_transformation)
 
     def UpdateCursor(self, layer, fields):
         return _StubCursor(self._table, fields, None, True)
@@ -1115,19 +1150,28 @@ class _StubArcpy(object):
         # The rows hold 2237 geometry at 1000 times the lon/lat.
         self.extent = _StubExtent(-82.7, 29.2, -82.1, 29.8, {
             2237: _StubExtent(-82700.0, 29200.0, -82100.0, 29800.0)})
+        # The layer's own system. The rows' 4326 geometry is what a cursor
+        # returns after any datum transformation.
+        self.layer_wkid = 4326
+        # What ListTransformations offers between two datums, first as default.
+        self.transformations = ["WGS_1984_(ITRF00)_To_NAD_1983",
+                                "NAD_1983_To_WGS_1984_5"]
         self.da = _StubDa(self)
 
     def Exists(self, path):
         return path == self.FC
 
     def Describe(self, layer):
-        return _StubDescribe(self.extent)
+        return _StubDescribe(self.extent, self.layer_wkid)
 
     def ListFields(self, layer):
         return [_StubField(n, t) for n, t in sorted(self.types.items())]
 
     def SpatialReference(self, wkid):
         return _StubSpatialReference(wkid)
+
+    def ListTransformations(self, source, target, extent=None):
+        return list(self.transformations)
 
 
 STUB_TYPES = {"OBJECTID": "OID", "X": "Double", "Y": "Double",
@@ -1615,6 +1659,26 @@ def self_test():
     check(stub.opened[-1][1] == 4326,
           "the scan passes the requested spatial reference to the cursor")
     check(stub.opened[-1][2] is False, "the scan opens no writing cursor")
+
+    # ---- a NAD83 layer compared in WGS84 lon/lat
+    check(datum_transformation(stub, _StubArcpy.FC, sr) is None,
+          "a layer already on the comparison datum needs no transformation")
+    nad83 = _StubArcpy([r for r in _stub_rows() if r["OBJECTID"] in (1, 2, 3)])
+    nad83.layer_wkid = 2237
+    check(datum_transformation(nad83, _StubArcpy.FC, sr)
+          == "WGS_1984_(ITRF00)_To_NAD_1983",
+          "a NAD83 layer read in WGS84 takes the first listed transformation, "
+          "the one Calculate Geometry Attributes uses")
+    code, text = run_stub(nad83)
+    check(code == 0 and "DRIFT             0" in text
+          and "WGS_1984_(ITRF00)_To_NAD_1983" in text,
+          "unmoved rows of a NAD83 layer read in WGS84 are OK, not a 0.5 m "
+          "DRIFT on every row, and the report names the transformation  "
+          "<-- pinned defect")
+    nad83.transformations = []
+    check(datum_transformation(nad83, _StubArcpy.FC, sr) is None,
+          "a datum pair with no listed transformation is read untransformed, "
+          "as Pro's own tools read it")
     verdicts = dict((p.oid, p.verdict) for p in scanned)
     check(verdicts == {1: OK, 2: OK, 3: OK, 4: DRIFT, 5: FILL, 6: NO_GEOMETRY,
                        7: DRIFT},

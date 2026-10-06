@@ -53,6 +53,8 @@ PASS  newline, CR, tab, ESC and DEL in an id print escaped, so an id cannot forg
 ...
 PASS  a projected --wkid reports the largest corner of the extent in that system, not the layer's own lon/lat corners  <-- pinned defect
 ...
+PASS  unmoved rows of a NAD83 layer read in WGS84 are OK, not a 0.5 m DRIFT on every row, and the report names the transformation  <-- pinned defect
+...
 PASS  the scan rounds the geometry, so noise under the grid is not drift  <-- pinned defect
 ...
 PASS  a row that moved north has its Y rewritten and its X left alone  <-- pinned defect
@@ -116,7 +118,7 @@ PASS  an exception of the wrong type is a failure, not a pass
 PASS  a run with a failure prints it and exits 1
 PASS  a green run prints the count and exits 0
 --------------------------------------------------------------------
-373 assertions, 0 failed
+377 assertions, 0 failed
 ```
 
 ## Requirements
@@ -134,7 +136,7 @@ Only one mode needs `arcpy`:
 | `--self-test` | No. | Only a temp directory, which it deletes again. |
 
 The self-test needs no `arcpy`, no network, no credentials and no geodatabase. It prints the same
-373 assertions, line for line, on Windows with Python 3.13, on Linux with Python 3.12, and on
+377 assertions, line for line, on Windows with Python 3.13, on Linux with Python 3.12, and on
 Windows with Python 3.9.
 
 ```
@@ -339,6 +341,12 @@ scheduled check under the wrong Python does not report drift every night.
   comparison is therefore written as "within the tolerance, or drift", so a NaN column is DRIFT
   and a resync writes the geometry's value over it. The check is in the shared core, so the layer
   scan and the file reader both get it.
+- **A layer on another datum.** A NAD83 state plane layer compared in WGS84 lon/lat crosses a
+  datum. Calculate Geometry Attributes fills the columns through the first transformation that
+  `arcpy.ListTransformations` lists, but a cursor applies none unless it is told. The scan uses
+  the same first transformation and prints its name. Without it, every unmoved row of such a
+  layer read as DRIFT by about 0.5 m, and `--apply` would have rewritten the whole layer. Under
+  ArcGIS Pro 3.6 that layer now reads as 5 OK rows and exits 0.
 - **The writing cursor.** The update cursor opens on the OID and the two columns, and never on a
   geometry token. The geometry is read by a separate cursor. A rounded geometry written back
   would move the point this tool exists to trust.
@@ -436,6 +444,11 @@ geometry, and nothing says why. This tool refuses that file and names the reason
   file. To fix the rows it names, run `--layer` with `--apply` under ArcGIS Pro.
 - The file mode compares only in EPSG:4326. It cannot reproject, so columns in any other system
   are refused rather than converted.
+- ArcGIS Pro writes GeoJSON from a NAD83 layer with no datum transformation. If the columns were
+  filled through a transformation, every row of that export reads as a uniform drift of about
+  0.5 m. Check such a layer with `--layer` instead.
+- The layer mode applies only the first transformation that ArcGIS Pro lists. Columns filled
+  through a different transformation read as a small uniform drift on every row.
 - A `crs` member that names EPSG:4326 is read as longitude first, which is the order RFC 7946
   fixes. A file that really holds latitude first reports every row as drift.
 - The check on columns that are plainly not degrees is a guard, not a proof. Columns in a
