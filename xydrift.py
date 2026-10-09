@@ -26,13 +26,19 @@ it. Both ends are pinned in the self-test.
     python xydrift.py --layer prod.sde/Addresses --tolerance 0.5 --tolerance-units meters
     python xydrift.py --layer prod.sde/Addresses --workspace prod.sde --apply
     python xydrift.py --from-geojson points.geojson --xy-crs 4326
+    python xydrift.py --layer prod.sde/Addresses --infer-crs
+    python xydrift.py --layer prod.sde/Addresses --infer-crs 4326,2237,2236
+    python xydrift.py --from-geojson points.geojson --infer-crs
 
 --layer needs arcpy. --from-geojson and --self-test need only the standard library,
-and --from-geojson never writes anything.
+and --from-geojson never writes anything. --infer-crs never writes either: it
+names the system the stored columns are in, or refuses on a tie or a mixed
+layer.
 
 Exit codes: 0 no drift or resync done, 1 drift found and not written, 2 the resync
 failed part way, 3 arcpy is missing or failed while reading, and nothing was
 written, 64 usage error, refused input, or no row had a geometry to compare.
+--infer-crs exits 0 when it names one system and 64 when it refuses.
 """
 
 from __future__ import print_function
@@ -94,6 +100,23 @@ LONLAT_CRS_NAMES = (
     "urn:ogc:def:crs:EPSG::4326",
     "EPSG:4326",
 )
+
+# --infer-crs. Web mercator (EPSG:3857) is tried by default beside the layer's
+# own system and 4326, because hosted layers often store X and Y in it.
+WEB_MERCATOR_WKID = 3857
+
+# WGS84 semi-major axis, which EPSG:3857 uses as the radius of a sphere.
+WEB_MERCATOR_RADIUS = 6378137.0
+
+# The only systems a GeoJSON file can be tested in, because the standard
+# library reprojects nothing and 3857 is closed form from lon/lat.
+FILE_CANDIDATES = (GEOJSON_WKID, WEB_MERCATOR_WKID)
+
+# Tolerance --infer-crs uses when none is given, in metres. It has to mean the
+# same distance in every candidate, so it is never in degrees. Half a metre is
+# above a column rounded to 5 decimals of a degree, and below the metre or so
+# between NAD83 and WGS84, which a wider tolerance reports as a tie.
+DEFAULT_INFER_TOLERANCE_METERS = 0.5
 
 # =============================================================================
 # End of CONFIGURATION.
@@ -630,6 +653,157 @@ def geojson_rows(doc, x_field, y_field):
     return rows
 
 
+# ------------------------------------------------- --infer-crs, pure core
+
+def web_mercator(lon, lat):
+    """EPSG:3857 easting and northing of a WGS84 lon/lat, or (None, None).
+
+    IOGP Guidance Note 7-2, method 1024 (Popular Visualisation Pseudo
+    Mercator): E = R * lon, N = R * ln(tan(pi/4 + lat/2)), with R the WGS84
+    semi-major axis. It is closed form, so a file can be tested against 3857
+    with no projection library. A pole has no northing, so it has no position.
+    """
+    if lat is None or abs(lat) >= 90.0:
+        return None, None
+    return (WEB_MERCATOR_RADIUS * math.radians(lon),
+            WEB_MERCATOR_RADIUS * math.log(
+                math.tan(math.pi / 4.0 + math.radians(lat) / 2.0)))
+
+
+def candidate_agreement(rows, tolerance, wrap):
+    """(rows read, keys compared, keys that agree) for one candidate system.
+
+    rows are (key, stored x, stored y, geometry x, geometry y), with the
+    geometry already in the candidate. A row is compared only when it has a
+    geometry and both columns hold a finite number. An empty or NaN column is
+    evidence for no system, and counted as compared it would count against
+    every candidate alike.
+    """
+    read = 0
+    compared = set()
+    agree = set()
+    for key, sx, sy, gx, gy in rows:
+        read += 1
+        gx, gy = geometry_xy(gx, gy)
+        if gx is None or not (is_number(sx) and is_number(sy)):
+            continue
+        compared.add(key)
+        if (classify_pair(sx, gx, tolerance, wrap) == OK
+                and classify_pair(sy, gy, tolerance) == OK):
+            agree.add(key)
+    return read, compared, agree
+
+
+def _epsg(codes):
+    return ", ".join("EPSG %d" % code for code in codes)
+
+
+def infer(results):
+    """Rank the candidates and name one system, or say why none can be named.
+
+    results is [(wkid, keys compared, keys that agree)] in the order the
+    candidates were given. A row that agrees with exactly one candidate is
+    evidence for it. A row that agrees with two is evidence for neither: a
+    point at 0, 0 is the same numbers in degrees and in web mercator metres.
+
+    The refusals, in order. Nothing compared. A tie, when most compared rows
+    agree with two candidates alike, so the tolerance cannot separate them.
+    A mixed layer, when two candidates each explain rows that no other does,
+    so no one --wkid compares the layer. No candidate explains any row on
+    its own. And a minority winner, when the one candidate left explains
+    half the compared rows or fewer, because the rest agree with nothing.
+    """
+    order = [wkid for wkid, _, _ in results]
+    agree = dict((wkid, keys) for wkid, _, keys in results)
+    compared = set()
+    for _, keys, _ in results:
+        compared |= keys
+    owners = {}
+    for wkid in order:
+        for key in agree[wkid]:
+            owners.setdefault(key, []).append(wkid)
+    exclusive = dict((wkid, set()) for wkid in order)
+    shared = set()
+    for key, wkids in owners.items():
+        if len(wkids) == 1:
+            exclusive[wkids[0]].add(key)
+        else:
+            shared.add(key)
+    # Stable, so equal candidates keep the order they were given in.
+    ranking = sorted(order, key=lambda w: (-len(exclusive[w]), -len(agree[w])))
+    explaining = [wkid for wkid in ranking if exclusive[wkid]]
+
+    winner = None
+    if not compared:
+        kind = "nothing"
+        reason = ("no row has a geometry and a number in both columns, so "
+                  "nothing was compared.")
+    elif len(shared) * 2 > len(compared):
+        kind = "tie"
+        reason = ("a tie. %d of %d compared rows agree with %s alike. Those "
+                  "systems are closer together here than the tolerance, so "
+                  "the columns cannot tell them apart. Tighten --tolerance."
+                  % (len(shared), len(compared),
+                     _epsg(w for w in ranking if agree[w] & shared)))
+    elif len(explaining) > 1:
+        kind = "mixed"
+        reason = ("a mixed layer. %s. One layer holds its columns in more "
+                  "than one system, so no single --wkid can check it."
+                  % "; ".join("%d row(s) agree only with EPSG %d"
+                              % (len(exclusive[w]), w) for w in explaining))
+    elif not explaining:
+        kind = "none"
+        reason = ("no candidate agrees with any compared row on its own. The "
+                  "columns are in a system that is not on the list, or every "
+                  "row has drifted.")
+    elif len(agree[explaining[0]]) * 2 <= len(compared):
+        kind = "minority"
+        reason = ("only %d of %d compared rows agree with EPSG %d, and the "
+                  "rest agree with no candidate. The system is not on the "
+                  "list, or most rows have drifted."
+                  % (len(agree[explaining[0]]), len(compared), explaining[0]))
+    else:
+        kind = "winner"
+        reason = None
+        winner = explaining[0]
+    return {"ranking": ranking, "agree": agree, "compared": compared,
+            "exclusive": exclusive, "shared": shared, "kind": kind,
+            "reason": reason, "winner": winner}
+
+
+def describe_inference(found, rows_read, tolerance_text, notes=None,
+                       labels=None, limit=DEFAULT_LIMIT):
+    """The --infer-crs report, as lines. Printing is the caller's."""
+    notes = notes or {}
+    labels = labels or {}
+    lines = ["rows read: %d" % rows_read,
+             "rows compared: %d (a geometry, and a number in both columns)"
+             % len(found["compared"]),
+             "tolerance: %s, converted into each candidate's own units"
+             % tolerance_text,
+             "",
+             "candidates, ranked by the rows that only they explain:"]
+    for wkid in found["ranking"]:
+        line = "  EPSG %-6d agree %6d   only this one %6d" % (
+            wkid, len(found["agree"][wkid]), len(found["exclusive"][wkid]))
+        if wkid in notes:
+            line += "   (%s)" % notes[wkid]
+        lines.append(line)
+    lines.append("rows that agree with more than one candidate: %d"
+                 % len(found["shared"]))
+    if found["kind"] == "mixed":
+        # The rows are the actionable part: they came from somewhere else.
+        for wkid in found["ranking"]:
+            keys = sorted(found["exclusive"][wkid])
+            if not keys:
+                continue
+            shown = ", ".join(printable(labels.get(k, k)) for k in keys[:limit])
+            more = len(keys) - limit
+            lines.append("rows that agree only with EPSG %d: OID %s%s" % (
+                wkid, shown, " ... and %d more" % more if more > 0 else ""))
+    return lines
+
+
 # ------------------------------------------------------------------ files
 
 def unique_names(pairs):
@@ -916,6 +1090,23 @@ def run(args, arcpy):
     return 0
 
 
+def column_refusal(arcpy, args, types, sr, geographic, tolerance):
+    """Reason the two columns cannot be compared in sr, or None.
+
+    A column that is not in the layer, that is not a number, or that is a
+    Single too coarse for the tolerance at the layer's magnitude in sr.
+    """
+    for field in (args.x_field, args.y_field):
+        if field not in types:
+            return "column %s is not in %s" % (field, args.layer)
+    magnitude = layer_magnitude(arcpy, args.layer, sr, geographic)
+    for field in (args.x_field, args.y_field):
+        reason = refuse_coord_field(field, types[field], tolerance, magnitude)
+        if reason is not None:
+            return reason
+    return None
+
+
 def check_layer(args, arcpy):
     """The read pass: every refusal, the scan and the report. Writes nothing.
 
@@ -949,18 +1140,10 @@ def check_layer(args, arcpy):
         print("error: %s" % exc, file=sys.stderr)
         return 64, None
 
-    for field in (args.x_field, args.y_field):
-        if field not in types:
-            print("error: column %s is not in %s" % (field, args.layer),
-                  file=sys.stderr)
-            return 64, None
-
-    magnitude = layer_magnitude(arcpy, args.layer, sr, geographic)
-    for field in (args.x_field, args.y_field):
-        reason = refuse_coord_field(field, types[field], tolerance, magnitude)
-        if reason is not None:
-            print("error: %s" % reason, file=sys.stderr)
-            return 64, None
+    reason = column_refusal(arcpy, args, types, sr, geographic, tolerance)
+    if reason is not None:
+        print("error: %s" % reason, file=sys.stderr)
+        return 64, None
 
     units_label = "degrees" if geographic else "linear units"
     transformation = datum_transformation(arcpy, args.layer, sr)
@@ -977,6 +1160,194 @@ def check_layer(args, arcpy):
         return 64, None
 
     return None, plans
+
+
+# ------------------------------------------------------------- --infer-crs
+
+def wkid_list(text):
+    """The --infer-crs value: EPSG codes split by commas, or [] for the defaults.
+
+    A code given twice is tested once, in the place it was first given.
+    """
+    if not text.strip():
+        return []
+    try:
+        codes = [int(part) for part in text.split(",")]
+    except ValueError:
+        codes = [0]
+    if any(code <= 0 for code in codes):
+        raise argparse.ArgumentTypeError(
+            "%r is not a list of EPSG codes split by commas, such as "
+            "4326,2237" % text)
+    return list(dict.fromkeys(codes))
+
+
+def infer_refusal(args):
+    """Reason the flags cannot go with --infer-crs, or None."""
+    for given, why in (
+            (args.apply,
+             "--apply does not apply to --infer-crs, which only reads. Name "
+             "the system first, then run the check with --wkid."),
+            (args.wkid != DEFAULT_WKID,
+             "--wkid does not apply to --infer-crs. It states the system of "
+             "the columns, and --infer-crs finds it."),
+            (args.xy_crs is not None,
+             "--xy-crs does not apply to --infer-crs. It states the system of "
+             "the columns, and --infer-crs finds it."),
+            (args.tolerance_units == "degrees",
+             "--tolerance-units degrees does not apply to --infer-crs. A "
+             "degree is a different distance in every candidate, so give the "
+             "tolerance in meters or feet."),
+            (len(args.infer_crs) == 1,
+             "--infer-crs ranks two or more systems, and was given only "
+             "EPSG %s." % ",".join("%d" % c for c in args.infer_crs))):
+        if given:
+            return why
+    return same_field_refusal(args)
+
+
+def finish_inference(found, lines, next_step):
+    """Print the report and the verdict. 0 names a system, 64 refuses."""
+    for line in lines:
+        print(line)
+    print("")
+    winner = found["winner"]
+    if winner is None:
+        # The table first, then the reason, even when both go to one pipe.
+        sys.stdout.flush()
+        print("error: no single system can be named: %s" % found["reason"],
+              file=sys.stderr)
+        return 64
+    print("result: the stored columns are in EPSG %d." % winner)
+    others = len(found["compared"]) - len(found["agree"][winner])
+    if others:
+        print("%d compared row(s) do not agree with EPSG %d. They have "
+              "drifted, or hold another system." % (others, winner))
+    print(next_step)
+    return 0
+
+
+def infer_layer(args, arcpy, value, units):
+    """--infer-crs on a layer: one read per candidate, never a write."""
+    if not arcpy.Exists(args.layer):
+        print("error: layer does not exist: %s" % args.layer, file=sys.stderr)
+        return 64
+    own = arcpy.Describe(args.layer).spatialReference.factoryCode
+    # A layer in an unknown or custom system reports 0, which is no candidate.
+    candidates = args.infer_crs or list(dict.fromkeys(
+        code for code in (own, GEOJSON_WKID, WEB_MERCATOR_WKID) if code))
+    fields = ["OID@", args.x_field, args.y_field, "SHAPE@X", "SHAPE@Y"]
+    results = []
+    notes = {}
+    read = 0
+    for wkid in candidates:
+        sr, geographic, meters_per_unit, types = layer_profile(
+            arcpy, args.layer, wkid)
+        try:
+            tolerance = resolve_tolerance(value, units, geographic,
+                                          meters_per_unit)
+        except ValueError as exc:
+            reason = "%s" % exc
+        else:
+            reason = column_refusal(arcpy, args, types, sr, geographic,
+                                    tolerance)
+        if reason is not None:
+            print("error: EPSG %d: %s" % (wkid, reason), file=sys.stderr)
+            return 64
+        # The same transformation the check itself would read through.
+        transformation = datum_transformation(arcpy, args.layer, sr)
+        if transformation is not None:
+            notes[wkid] = "datum transformation %s" % transformation
+        with arcpy.da.SearchCursor(args.layer, fields, spatial_reference=sr,
+                                   datum_transformation=transformation) as cur:
+            read, compared, agree = candidate_agreement(cur, tolerance,
+                                                        geographic)
+        results.append((wkid, compared, agree))
+    found = infer(results)
+    lines = describe_inference(found, read, "%g %s" % (value, units), notes,
+                               None, args.limit)
+    return finish_inference(found, lines, "Next: check the layer for drift "
+                            "with --wkid %s." % found["winner"])
+
+
+def infer_geojson(args, value, units):
+    """--infer-crs on a GeoJSON file, in 4326 and 3857 only. Never writes."""
+    candidates = args.infer_crs or list(FILE_CANDIDATES)
+    foreign = [code for code in candidates if code not in FILE_CANDIDATES]
+    if foreign:
+        print("error: --infer-crs on a file can test only EPSG 4326 and 3857, "
+              "because this mode cannot reproject. Refused: %s. Run --layer "
+              "with --infer-crs under ArcGIS Pro for any other system."
+              % _epsg(foreign), file=sys.stderr)
+        return 64
+    try:
+        tolerances = dict((code, resolve_tolerance(
+            value, units, code == GEOJSON_WKID, 1.0)) for code in candidates)
+    except ValueError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 64
+    try:
+        doc, stamp = load_geojson(args.from_geojson)
+        reason = geojson_crs_refusal(doc)
+        if reason is not None:
+            raise ValueError(reason)
+        # Not geojson_rows: its check that the columns are degrees is the
+        # very question being asked here.
+        rows = feature_rows(doc, args.x_field, args.y_field)
+    except (OSError, ValueError, RecursionError, MemoryError) as exc:
+        print("error: %s: %s" % (printable(args.from_geojson), exc),
+              file=sys.stderr)
+        return 64
+
+    # Keyed by position, because a file's ids need not be unique or hashable.
+    labels = dict((index, row[0]) for index, row in enumerate(rows, 1))
+    results = []
+    for code in candidates:
+        keyed = []
+        for index, (_, sx, sy, gx, gy) in enumerate(rows, 1):
+            if code == WEB_MERCATOR_WKID:
+                gx, gy = web_mercator(gx, gy)
+            keyed.append((index, sx, sy, gx, gy))
+        _, compared, agree = candidate_agreement(keyed, tolerances[code],
+                                                 code == GEOJSON_WKID)
+        results.append((code, compared, agree))
+    found = infer(results)
+    print("source: %s, file modified %s. A file is a snapshot, not the live "
+          "layer." % (printable(args.from_geojson), stamp))
+    lines = describe_inference(found, len(rows), "%g %s" % (value, units),
+                               None, labels, args.limit)
+    if found["winner"] == GEOJSON_WKID:
+        step = ("Next: check the file for drift with --xy-crs 4326.")
+    else:
+        step = ("This mode compares only in EPSG 4326. Check the layer itself "
+                "under ArcGIS Pro with --layer and --wkid %s."
+                % found["winner"])
+    return finish_inference(found, lines, step)
+
+
+def run_infer(args):
+    """The whole --infer-crs run. Read-only in both modes."""
+    reason = infer_refusal(args)
+    if reason is not None:
+        print("error: %s" % reason, file=sys.stderr)
+        return 64
+    value = args.tolerance
+    if value is None:
+        value = DEFAULT_INFER_TOLERANCE_METERS
+    units = args.tolerance_units or "meters"
+    if args.from_geojson:
+        return infer_geojson(args, value, units)
+    arcpy = _import_arcpy()
+    if arcpy is None:
+        return 3
+    try:
+        return infer_layer(args, arcpy, value, units)
+    except Exception as exc:
+        # A candidate arcpy cannot build or project into raises here.
+        # Uncaught, the traceback exits 1.
+        print("error: reading %s failed: %s. Nothing was written."
+              % (args.layer, exc), file=sys.stderr)
+        return 3
 
 
 # ------------------------------------------------------------------ self-test
@@ -1021,9 +1392,11 @@ class _StubSpatialReference(object):
 
     def __init__(self, wkid):
         self.factoryCode = wkid
-        self.type = "Geographic" if wkid == 4326 else "Projected"
-        self.metersPerUnit = None if wkid == 4326 else 0.3048006096012192
-        self.GCS = _StubField("GCS_North_American_1983" if wkid == 2237
+        geographic = wkid in (4326, 4269)
+        self.type = "Geographic" if geographic else "Projected"
+        self.metersPerUnit = (None if geographic else
+                              1.0 if wkid == 3857 else 0.3048006096012192)
+        self.GCS = _StubField("GCS_North_American_1983" if wkid in (2237, 4269)
                               else "GCS_WGS_1984", "GCS")
 
 
@@ -1197,6 +1570,30 @@ def _stub_rows():
         # OBJECTID 7 moved north only, so its X must not be rewritten.
         row(7, -82.7, 29.8, -82.7, 29.8001),
     ]
+
+
+def _infer_stub(systems):
+    """A stub layer in 4326 whose rows store X and Y in the systems named.
+
+    One row per entry. None leaves both columns empty. The 2237 and 3857
+    geometry is what a cursor returns in that system: 2237 is the stub's
+    usual 1000 times the lon/lat, and 3857 is the closed form.
+    """
+    rows = []
+    for oid, wkid in enumerate(systems, 1):
+        lon, lat = -82.0 - oid / 100.0, 29.0 + oid / 100.0
+        geom = {4326: (lon, lat), 4269: (lon, lat),
+                2237: (lon * 1000.0, lat * 1000.0),
+                3857: web_mercator(lon, lat)}
+        sx, sy = geom[wkid] if wkid else (None, None)
+        rows.append({"OBJECTID": oid, "X": sx, "Y": sy, "LABEL": "i%d" % oid,
+                     "geom": geom})
+    stub = _StubArcpy(rows)
+    stub.extent = _StubExtent(-82.7, 29.0, -82.0, 29.7, {
+        2237: _StubExtent(-82700.0, 29000.0, -82000.0, 29700.0),
+        3857: _StubExtent(*(web_mercator(-82.7, 29.0)
+                            + web_mercator(-82.0, 29.7)))})
+    return stub
 
 
 def _stub_geojson(rows=None):
@@ -2478,6 +2875,91 @@ def self_test():
               "a CJK id, a lone surrogate id and a CJK file name print as "
               "ASCII escapes, so no console encoding can stop the "
               "report  <-- pinned defect")
+
+        # ---- --infer-crs on a file
+        def point_file(name, points):
+            """A file of (id, x column, y column, lon, lat) points."""
+            return tmpfile(name, json.dumps({
+                "type": "FeatureCollection", "features": [
+                    {"type": "Feature", "id": fid, "geometry": {
+                        "type": "Point", "coordinates": [lon, lat]},
+                     "properties": {"X": sx, "Y": sy}}
+                    for fid, sx, sy, lon, lat in points]}))
+
+        # The columns are PROJ 9.8.1's EPSG:3857 numbers, not this module's.
+        proj_mercator = point_file("mercator.geojson", [
+            (1, -9161594.092286414, 3426656.25037027, -82.3, 29.4),
+            (2, -9139330.194127759, 3401126.26406649, -82.1, 29.2),
+            (3, 1113194.9079327357, -8399737.889818357, 10.0, -60.0)])
+        listing = sorted(os.listdir(tmp))
+        before = read_bytes(proj_mercator)
+        with mock.patch.dict(sys.modules, {"arcpy": None}):
+            code, out = run_cli(["--from-geojson", proj_mercator,
+                                 "--infer-crs"])
+        check(code == 0 and "are in EPSG 3857." in out
+              and "--layer and --wkid 3857" in out,
+              "a file whose columns PROJ wrote in web mercator is named 3857, "
+              "with arcpy made unimportable")
+        check(read_bytes(proj_mercator) == before
+              and sorted(os.listdir(tmp)) == listing,
+              "--infer-crs on a file changed no byte of it and wrote no other "
+              "file")
+        code, out = run_cli(["--from-geojson", proj_mercator, "--xy-crs",
+                             "4326"])
+        check(code == 64 and "whatever --xy-crs says" in out,
+              "the same file checked as 4326 is refused, which is the case "
+              "--infer-crs exists for")
+        code, out = run_cli(["--from-geojson", drift_path, "--infer-crs"])
+        check(code == 0 and "rows read: 7" in out and "rows compared: 5" in out
+              and "are in EPSG 4326." in out
+              and "2 compared row(s) do not agree with EPSG 4326" in out
+              and "Next: check the file for drift with --xy-crs 4326." in out,
+              "the drift fixture is named 4326, and its two drifted rows are "
+              "counted against it, not for another system")
+        island_path = point_file("island.geojson", [
+            (1, 0.0, 0.0, 0.0, 0.0), (2, -82.1, 29.2, -82.1, 29.2),
+            (3, -82.2, 29.3, -82.2, 29.3)])
+        code, out = run_cli(["--from-geojson", island_path, "--infer-crs"])
+        check(code == 0 and "are in EPSG 4326." in out
+              and "more than one candidate: 1" in out,
+              "a file with a point at 0, 0 is named 4326, and the row that "
+              "agrees with both is counted as shared  <-- pinned defect")
+        mixed_path = point_file("mixed.geojson", [
+            ("a", -82.1, 29.2, -82.1, 29.2), ("b", -82.2, 29.3, -82.2, 29.3),
+            ("c", -82.3, 29.4, -82.3, 29.4),
+            ("d", -9161594.092286414, 3426656.25037027, -82.3, 29.4),
+            ("e", -9139330.194127759, 3401126.26406649, -82.1, 29.2)])
+        code, out = run_cli(["--from-geojson", mixed_path, "--infer-crs"])
+        check(code == 64 and "a mixed layer" in out
+              and "rows that agree only with EPSG 3857: OID d, e" in out,
+              "a file with rows in degrees and rows in web mercator is "
+              "refused, and the web mercator rows are named by id  "
+              "<-- pinned defect")
+        code, out = run_cli(["--from-geojson", drift_path, "--infer-crs",
+                             "4326,2237"])
+        check(code == 64 and "can test only EPSG 4326 and 3857" in out
+              and "Refused: EPSG 2237" in out,
+              "a file refuses a candidate it cannot project into")
+        code, out = run_cli(["--from-geojson", drift_path, "--infer-crs",
+                             "--xy-crs", "4326"])
+        check(code == 64 and "--xy-crs does not apply" in out,
+              "--xy-crs with --infer-crs on a file is refused")
+        code, out = run_cli(["--from-geojson", drift_path, "--infer-crs",
+                             "--tolerance", "1e-9"])
+        check(code == 64 and "rounding itself" in out,
+              "a tolerance below the grid in any candidate is refused")
+        code, out = run_cli(["--from-geojson", tmpfile("bad2.geojson", "{"),
+                             "--infer-crs"])
+        check(code == 64 and "bad2.geojson" in out,
+              "a file that is not JSON is refused by name")
+        code, out = run_cli(["--from-geojson", tmpfile(
+            "crs2.geojson", json.dumps(crs_doc)), "--infer-crs"])
+        check(code == 64 and "cannot reproject" in out,
+              "a file that declares projected geometry is refused here too")
+        code, out = run_cli(["--from-geojson", tmpfile(
+            "nogeom2.geojson", json.dumps(shapeless_doc)), "--infer-crs"])
+        check(code == 64 and "nothing was compared" in out,
+              "a file with no geometry names no system")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     check(not os.path.exists(tmp), "the self-test removed its temp directory")
@@ -2537,6 +3019,230 @@ def self_test():
     check(code == 1 and "resync 3 row(s)" in out,
           "the real entry point imports arcpy and runs the layer check")
 
+    # ---- --infer-crs: the pure core
+    origin = web_mercator(0.0, 0.0)
+    check(origin[0] == 0.0 and abs(origin[1]) < 1e-9
+          and rounded(origin[1]) == 0.0,
+          "web mercator puts 0, 0 at its origin, to under a nanometre and "
+          "exactly on the grid")
+    check(web_mercator(180.0, 0.0)[0] == 20037508.342789244,
+          "web mercator puts 180 degrees at 20037508.342789244 m, half the "
+          "equator of the WGS84 sphere")
+    north = web_mercator(-82.3, 29.4)
+    south = web_mercator(10.0, -60.0)
+    check(abs(north[0] - -9161594.092286414) < 1e-6
+          and abs(north[1] - 3426656.25037027) < 1e-6
+          and abs(south[0] - 1113194.9079327357) < 1e-6
+          and abs(south[1] - -8399737.889818357) < 1e-6,
+          "web mercator matches PROJ 9.8.1 to a micrometre, north and south "
+          "of the equator")
+    check(web_mercator(0.0, 90.0) == (None, None)
+          and web_mercator(0.0, -90.0) == (None, None)
+          and web_mercator(None, None) == (None, None),
+          "a pole and a missing geometry have no web mercator position, not "
+          "a traceback")
+
+    sample = [(1, -82.1, 29.2, -82.1, 29.2),
+              (2, -82.2, 29.3, -82.1999, 29.3),
+              (3, None, 29.4, -82.3, 29.4),
+              (4, nan, 29.5, -82.4, 29.5),
+              (5, -82.5, 29.6, None, None),
+              (6, -82.6, 29.7, nan, 29.7)]
+    read, compared, agree = candidate_agreement(sample, tol, True)
+    check(read == 6 and compared == {1, 2} and agree == {1},
+          "a candidate compares only rows with a geometry and a number in "
+          "both columns, and counts the ones that agree")
+    check(candidate_agreement([(1, 0.0, 29.2, 0.0, 29.2001)], tol, True)[2]
+          == set(), "a row agrees only when both of its columns agree")
+    seam_row = [(1, 180.0, 10.0, -180.0, 10.0)]
+    check(candidate_agreement(seam_row, tol, True)[2] == {1}
+          and candidate_agreement(seam_row, tol, False)[2] == set(),
+          "a geographic candidate wraps the antimeridian and a projected one "
+          "does not")
+
+    ten = set(range(1, 11))
+    won = infer([(2237, ten, set(range(1, 10))), (4326, ten, set()),
+                 (3857, ten, set())])
+    check(won["winner"] == 2237 and won["kind"] == "winner"
+          and won["reason"] is None,
+          "the one candidate that explains 9 of 10 rows on its own is named")
+    tie = infer([(4326, ten, set(ten)), (4269, ten, set(ten))])
+    check(tie["winner"] is None and tie["kind"] == "tie"
+          and "EPSG 4326, EPSG 4269 alike" in tie["reason"],
+          "two candidates that agree with every row alike are a tie, not a "
+          "win for the one listed first  <-- pinned defect")
+    near = infer([(4326, ten, set(ten)), (4269, ten, set(range(1, 9)))])
+    check(near["kind"] == "tie" and near["winner"] is None,
+          "8 rows shared and 2 rows that only one candidate explains is "
+          "still a tie, not a win on 2 rows  <-- pinned defect")
+    half_shared = infer([(4326, ten, set(ten)),
+                         (4269, ten, set(range(1, 6)))])
+    check(half_shared["winner"] == 4326,
+          "exactly half the rows shared is not a tie, so the tie edge is "
+          "strict")
+    island = infer([(4326, ten, set(ten)), (3857, ten, {1})])
+    check(island["winner"] == 4326 and island["shared"] == {1},
+          "a row at 0, 0, the same numbers in degrees and in web mercator "
+          "metres, makes no tie  <-- pinned defect")
+    mixed = infer([(4326, ten, set(range(1, 7))),
+                   (2237, ten, set(range(7, 11))), (3857, ten, set())])
+    check(mixed["kind"] == "mixed" and mixed["winner"] is None
+          and "6 row(s) agree only with EPSG 4326; 4 row(s) agree only with "
+          "EPSG 2237" in mixed["reason"],
+          "6 rows in degrees and 4 in feet are a mixed layer, refused, not a "
+          "win for 4326 by majority  <-- pinned defect")
+    stray = infer([(4326, ten, set(range(1, 10))), (2237, ten, {10})])
+    check(stray["kind"] == "mixed",
+          "one row in another system is enough to make a layer mixed")
+    check(infer([(4326, ten, set()), (3857, ten, set())])["kind"] == "none",
+          "no candidate agreeing with any row is refused")
+    minority = infer([(4326, ten, set(range(1, 6))), (3857, ten, set())])
+    check(minority["kind"] == "minority"
+          and "only 5 of 10" in minority["reason"],
+          "a candidate that explains only half the compared rows is not "
+          "named  <-- pinned defect")
+    check(infer([(4326, ten, set(range(1, 7))), (3857, ten, set())])
+          ["winner"] == 4326, "six of ten is a majority and is named")
+    check(infer([(4326, set(), set()), (3857, set(), set())])["kind"]
+          == "nothing", "a run that compared no row names nothing")
+    check(infer([(3857, ten, set()), (4326, ten, set(ten))])["ranking"]
+          == [4326, 3857]
+          and infer([(3857, ten, set()), (2237, ten, set())])["ranking"]
+          == [3857, 2237],
+          "the ranking puts the explaining candidate first, and keeps the "
+          "given order between candidates that explain nothing")
+
+    mixed_text = "\n".join(describe_inference(
+        mixed, 12, "0.5 meters", {2237: "datum transformation T"},
+        {7: "a\nb"}, 2))
+    check("rows read: 12" in mixed_text and "rows compared: 10" in mixed_text
+          and "tolerance: 0.5 meters" in mixed_text,
+          "the inference report counts the rows read and compared, and "
+          "states the tolerance")
+    check("EPSG 2237   agree      4   only this one      4   (datum "
+          "transformation T)" in mixed_text,
+          "the report names the transformation a candidate was read through")
+    check("rows that agree only with EPSG 4326: OID 1, 2 ... and 4 more"
+          in mixed_text
+          and "rows that agree only with EPSG 2237: OID a\\x0ab, 8 ... and 2 "
+          "more" in mixed_text and "only with EPSG 3857" not in mixed_text,
+          "a mixed report names each system's rows, escaped and up to "
+          "--limit, and skips a candidate that explains none")
+    check("agree only" not in "\n".join(describe_inference(won, 10, "1 feet")),
+          "a report that names a system lists no rows")
+
+    # ---- --infer-crs on a layer, through the real entry point
+    def infer_cli(stub, *extra):
+        with mock.patch.dict(sys.modules, {"arcpy": stub}):
+            return run_cli(["--layer", _StubArcpy.FC, "--infer-crs"]
+                           + list(extra))
+
+    feet = _infer_stub([2237] * 6)
+    code, out = infer_cli(feet)
+    check(code == 64 and "not on the list" in out
+          and [w for _, w, _ in feet.opened] == [4326, 3857],
+          "with no list a 4326 layer tries 4326 and 3857, and columns in "
+          "feet agree with neither, so it refuses rather than guess")
+    feet = _infer_stub([2237] * 6)
+    code, out = infer_cli(feet, "4326,2237,3857")
+    check(code == 0 and "result: the stored columns are in EPSG 2237." in out
+          and "Next: check the layer for drift with --wkid 2237." in out,
+          "columns in state plane feet on a lon/lat layer are named 2237")
+    check(feet.updates == 0 and [f for f, _, w in feet.opened if w] == []
+          and [w for _, w, _ in feet.opened] == [4326, 2237, 3857],
+          "--infer-crs reads each candidate through its own cursor, and opens "
+          "no writing cursor  <-- pinned defect")
+    check("(datum transformation WGS_1984_(ITRF00)_To_NAD_1983)" in out,
+          "a candidate on another datum is read through the transformation "
+          "the check would use")
+
+    degrees = _infer_stub([4326] * 5 + [None])
+    code, out = infer_cli(degrees)
+    check(code == 0 and "rows read: 6" in out and "rows compared: 5" in out
+          and "are in EPSG 4326." in out and "do not agree" not in out,
+          "lon/lat columns are named 4326, and an empty row is not compared")
+    code, out = infer_cli(_infer_stub([3857] * 4))
+    check(code == 0 and "are in EPSG 3857." in out,
+          "web mercator columns are named 3857")
+    drifted = _infer_stub([4326] * 4)
+    drifted.rows[2]["X"] += 0.0001
+    code, out = infer_cli(drifted)
+    check(code == 0 and "are in EPSG 4326." in out
+          and "1 compared row(s) do not agree with EPSG 4326" in out,
+          "one drifted row does not stop the inference, and is counted")
+    mixed_stub = _infer_stub([4326] * 3 + [2237] * 2)
+    code, out = infer_cli(mixed_stub, "4326,2237")
+    check(code == 64 and "a mixed layer" in out
+          and "rows that agree only with EPSG 2237: OID 4, 5" in out,
+          "a layer with rows in degrees and rows in feet is refused, and the "
+          "rows in feet are named  <-- pinned defect")
+    code, out = infer_cli(_infer_stub([4326] * 4), "4326,4269")
+    check(code == 64 and "a tie" in out and "EPSG 4326, EPSG 4269" in out,
+          "a NAD83 lon/lat candidate that reads the same as WGS84 here is "
+          "refused as a tie  <-- pinned defect")
+    own = _infer_stub([2237] * 3)
+    own.layer_wkid = 2237
+    code, out = infer_cli(own)
+    check(code == 0 and "are in EPSG 2237." in out
+          and [w for _, w, _ in own.opened] == [2237, 4326, 3857],
+          "with no list a layer tries its own system first, then 4326 and "
+          "3857")
+    unknown = _infer_stub([4326] * 3)
+    unknown.layer_wkid = 0
+    code, out = infer_cli(unknown)
+    check(code == 0 and [w for _, w, _ in unknown.opened] == [4326, 3857],
+          "a layer in an unknown system, code 0, does not try 0")
+    shapeless_infer = _infer_stub([4326] * 2)
+    for row in shapeless_infer.rows.values():
+        row["geom"] = None
+    code, out = infer_cli(shapeless_infer)
+    check(code == 64 and "nothing was compared" in out,
+          "a layer with no geometry names no system")
+    code, out = infer_cli(_infer_stub([4326] * 3), "--tolerance", "1",
+                          "--tolerance-units", "feet")
+    check(code == 0 and "tolerance: 1 feet" in out,
+          "a foot tolerance is accepted and reported")
+
+    refusals = []
+    for extra, said in ((["--apply"], "only reads"),
+                        (["--wkid", "2237"], "--infer-crs finds it"),
+                        (["--xy-crs", "4326"], "--xy-crs does not apply"),
+                        (["--tolerance-units", "degrees"], "meters or feet"),
+                        (["4326"], "given only EPSG 4326"),
+                        (["--y-field", "X"], "both name X")):
+        stub = _infer_stub([4326] * 3)
+        code, out = infer_cli(stub, *extra)
+        refusals.append(code == 64 and said in out and stub.opened == []
+                        and stub.updates == 0)
+    check(refusals == [True] * 6,
+          "--apply, --wkid, --xy-crs, degrees, a single candidate and one "
+          "column named twice are refused before any cursor opens  "
+          "<-- pinned defect")
+    with mock.patch.dict(sys.modules, {"arcpy": _infer_stub([4326])}):
+        code, out = run_cli(["--layer", "nowhere.gdb/P", "--infer-crs"])
+    check(code == 64 and "does not exist" in out,
+          "--infer-crs on a layer that does not exist is refused")
+    code, out = infer_cli(_infer_stub([4326] * 3), "--x-field", "LON")
+    check(code == 64 and "EPSG 4326: column LON is not in" in out,
+          "a missing column is refused, naming the candidate")
+    code, out = infer_cli(_infer_stub([4326] * 3), "--tolerance", "nan")
+    check(code == 64 and "not a distance" in out,
+          "a NaN tolerance is refused for --infer-crs as well")
+    single_infer = _infer_stub([4326] * 3)
+    single_infer.types = {"OBJECTID": "OID", "X": "Single", "Y": "Single"}
+    code, out = infer_cli(single_infer)
+    check(code == 64 and "is a Single" in out and single_infer.opened == [],
+          "a Single lon/lat column too coarse for half a metre is refused "
+          "before any cursor opens")
+    code, out = infer_cli(_infer_stub([4326] * 3), "4326,9999")
+    check(code == 3 and "reading stub.gdb/Points failed" in out,
+          "a candidate the layer cannot be read in exits 3, not a traceback "
+          "that exits 1")
+    with mock.patch.dict(sys.modules, {"arcpy": None}):
+        code, out = run_cli(["--layer", _StubArcpy.FC, "--infer-crs"])
+    check(code == 3 and "arcpy was not found" in out,
+          "--infer-crs on a layer without arcpy exits 3")
+
     # ---- argument handling
     a = _parse(["--layer", "L"])
     check(a.apply is False, "--apply defaults to OFF")
@@ -2594,6 +3300,28 @@ def self_test():
           "the resync failed part way  <-- pinned defect")
     check(a.from_geojson is None and a.xy_crs is None,
           "--from-geojson and --xy-crs default to none")
+    check(a.infer_crs is None
+          and _parse(["--layer", "L", "--infer-crs"]).infer_crs == []
+          and _parse(["--layer", "L", "--infer-crs", "4326,2237"]).infer_crs
+          == [4326, 2237]
+          and _parse(["--layer", "L", "--infer-crs", " 4326,4326, 2237"])
+          .infer_crs == [4326, 2237],
+          "--infer-crs is off by default, empty for the defaults, and a list "
+          "with each code once")
+    bad_lists = []
+    for argv in (["--layer", "L", "--infer-crs", "EPSG:4326"],
+                 ["--layer", "L", "--infer-crs", "4326,"],
+                 ["--layer", "L", "--infer-crs", "0,4326"],
+                 ["--layer", "L", "--infer"]):
+        err = io.StringIO()
+        try:
+            with contextlib.redirect_stderr(err):
+                _parse(argv)
+        except SystemExit as exc:
+            bad_lists.append(exc.code)
+    check(bad_lists == [64] * 4,
+          "a code that is not a positive number, a trailing comma, and the "
+          "prefix --infer are usage errors that exit 64")
 
     # ---- the stub's own guards, so a wrong test fails loudly
     stub = _StubArcpy(_stub_rows())
@@ -2702,6 +3430,14 @@ def _parse(argv):
     ap.add_argument("--apply", action="store_true",
                     help="write the resynced coordinates. Without this nothing "
                          "is written.")
+    ap.add_argument("--infer-crs", dest="infer_crs", nargs="?", const="",
+                    type=wkid_list, metavar="EPSG,...",
+                    help="rank the systems the stored columns could be in, "
+                         "and name one or refuse on a tie or a mixed layer. "
+                         "Read-only. With no list a layer tries its own "
+                         "system, %d and %d, and a file tries %d and %d."
+                         % (GEOJSON_WKID, WEB_MERCATOR_WKID, GEOJSON_WKID,
+                            WEB_MERCATOR_WKID))
     ap.add_argument("--self-test", dest="self_test", action="store_true",
                     help="run the offline assertions and exit")
     return ap.parse_args(argv)
@@ -2726,6 +3462,8 @@ def main(argv=None):
         print("error: --limit cannot be negative.", file=sys.stderr)
         return 64
 
+    if args.infer_crs is not None:
+        return run_infer(args)
     if args.from_geojson:
         return run_geojson(args)
     if args.xy_crs is not None:
