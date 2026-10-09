@@ -113,12 +113,13 @@ PASS  one column named as both X and Y is refused before --apply can write the l
 PASS  an arcpy that fails to start without a licence exits 3, not a traceback that exits 1  <-- pinned defect
 ...
 PASS  the real entry point imports arcpy and runs the layer check
+PASS  a unique prefix of --apply is refused, not read as --apply  <-- pinned defect
 ...
 PASS  an exception of the wrong type is a failure, not a pass
 PASS  a run with a failure prints it and exits 1
 PASS  a green run prints the count and exits 0
 --------------------------------------------------------------------
-377 assertions, 0 failed
+378 assertions, 0 failed
 ```
 
 ## Requirements
@@ -136,7 +137,7 @@ Only one mode needs `arcpy`:
 | `--self-test` | No. | Only a temp directory, which it deletes again. |
 
 The self-test needs no `arcpy`, no network, no credentials and no geodatabase. It prints the same
-377 assertions, line for line, on Windows with Python 3.13, on Linux with Python 3.12, and on
+378 assertions, line for line, on Windows with Python 3.13, on Linux with Python 3.12, and on
 Windows with Python 3.9.
 
 ```

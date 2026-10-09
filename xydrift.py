@@ -2560,6 +2560,14 @@ def self_test():
     check(_parse(["--layer", "L", "--workspace", "w"]).workspace == "w",
           "--workspace is read")
     check(_parse(["--layer", "L", "--apply"]).apply is True, "--apply is read")
+    prefix_refused = False
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            _parse(["--layer", "L", "--ap"])
+        except SystemExit as exc:
+            prefix_refused = exc.code == 64
+    check(prefix_refused, "a unique prefix of --apply is refused, not read as "
+          "--apply  <-- pinned defect")
     err = io.StringIO()
     with contextlib.redirect_stderr(err):
         bad_limit = main(["--layer", "L", "--limit", "-1"])
@@ -2658,6 +2666,7 @@ def _parse(argv):
         description="Name the rows whose stored X and Y columns disagree with "
                     "their own geometry, and resync only those.",
         epilog="Nothing is written without --apply.",
+        allow_abbrev=False,
     )
     ap.add_argument("--layer", help="point feature class to check. Needs arcpy.")
     ap.add_argument("--from-geojson", dest="from_geojson", metavar="FILE",
